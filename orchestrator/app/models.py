@@ -5,7 +5,7 @@ import hashlib
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .time_utils import now_utc
 
@@ -72,6 +72,56 @@ class Finding(BaseModel):
     advisory_url: str | None = None
     scanner: str = Field(..., description="pip-audit|bandit|semgrep|npm-audit|osv-scanner|manual")
     scanned_at: datetime = Field(default_factory=now_utc)
+
+    @field_validator("repo")
+    @classmethod
+    def _repo_is_owner_slash_repo(cls, v: str) -> str:
+        if v.count("/") != 1 or not all(v.split("/")):
+            raise ValueError(f"repo must be 'owner/name', got {v!r}")
+        return v
+
+    @field_validator("cvss")
+    @classmethod
+    def _cvss_in_range(cls, v: float | None) -> float | None:
+        if v is None:
+            return v
+        if not 0.0 <= v <= 10.0:
+            raise ValueError(f"cvss must be between 0.0 and 10.0, got {v}")
+        return v
+
+    @field_validator("line")
+    @classmethod
+    def _line_positive(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v < 1:
+            raise ValueError(f"line must be >= 1, got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def _kind_specific_required_fields(self) -> Finding:
+        """Enforce per-kind required fields so malformed scanner output is
+        rejected at the /ingest boundary, not surfaced as a confusing
+        KeyError halfway through the pipeline.
+        """
+        if self.kind == FindingKind.DEP_CVE:
+            missing = [
+                name
+                for name, val in (
+                    ("package_name", self.package_name),
+                    ("installed_version", self.installed_version),
+                    ("manifest_path", self.manifest_path),
+                )
+                if not val
+            ]
+            if missing:
+                raise ValueError(
+                    f"dep_cve finding is missing required fields: {', '.join(missing)}"
+                )
+        elif self.kind == FindingKind.SAST:
+            if not self.file_path:
+                raise ValueError("sast finding is missing required field: file_path")
+        return self
 
     def dedupe_key(self) -> str:
         """Stable hash used for idempotency.

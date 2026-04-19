@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from .logging_config import get_logger
+from .retry import with_retry
 
 log = get_logger("devin")
 
@@ -48,10 +49,25 @@ class DevinClient:
             "Content-Type": "application/json",
         }
 
-    async def _request(self, method: str, path: str, **kw: Any) -> httpx.Response:
+    async def _request(
+        self, method: str, path: str, *, retry: bool = False, **kw: Any
+    ) -> httpx.Response:
+        """Issue a request; optionally retry on transient failures.
+
+        Set ``retry=True`` for idempotent calls (GETs, or POSTs the API
+        guarantees to dedupe server-side). Non-idempotent POSTs leave it
+        False so a partial network failure doesn't silently duplicate state.
+        """
         url = f"{self._org_url}{path}"
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            r = await c.request(method, url, headers=self._headers(), **kw)
+
+        async def _once() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                return await c.request(method, url, headers=self._headers(), **kw)
+
+        if retry:
+            r = await with_retry(_once, op=f"devin:{method} {path}")
+        else:
+            r = await _once()
         if r.status_code >= 400:
             log.warning(
                 "devin_api_error",
@@ -98,14 +114,18 @@ class DevinClient:
             body["create_as_user_id"] = create_as_user_id
         if playbook_id:
             body["playbook_id"] = playbook_id
-        r = await self._request("POST", "/sessions", json=body)
+        # create_session with idempotent=True is safe to retry: Devin
+        # deduplicates server-side on a hash of the prompt+tags+user.
+        r = await self._request(
+            "POST", "/sessions", json=body, retry=bool(idempotent)
+        )
         r.raise_for_status()
         return r.json()
 
     async def get_session(self, session_id: str) -> dict:
         if self.mock:
             return {"session_id": session_id, "status": "running", "pull_requests": []}
-        r = await self._request("GET", f"/sessions/{session_id}")
+        r = await self._request("GET", f"/sessions/{session_id}", retry=True)
         r.raise_for_status()
         return r.json()
 
@@ -125,7 +145,7 @@ class DevinClient:
             path = f"/sessions?limit={page_size}"
             if cursor:
                 path += f"&cursor={cursor}"
-            r = await self._request("GET", path)
+            r = await self._request("GET", path, retry=True)
             if r.status_code != 200:
                 break
             body = r.json()
@@ -141,8 +161,14 @@ class DevinClient:
         if self.mock:
             log.info("mock_devin_send_message", session_id=session_id, message=message[:200])
             return
+        # send_message is best-effort feedback to a running session; a
+        # duplicate message on retry is harmless (Devin sees it twice at
+        # worst).
         r = await self._request(
-            "POST", f"/sessions/{session_id}/message", json={"message": message}
+            "POST",
+            f"/sessions/{session_id}/message",
+            json={"message": message},
+            retry=True,
         )
         r.raise_for_status()
 

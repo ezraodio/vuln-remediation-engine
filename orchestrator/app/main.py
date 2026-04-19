@@ -185,12 +185,19 @@ async def reconcile(
     _authz(settings, x_ingest_secret)
     pipeline: RemediationPipeline = app.state.pipeline
     store: Store = app.state.store
-    updated = 0
+    # Terminal rows (FAILED/FILTERED/DEDUPED/VERIFIED_FIXED/VERIFICATION_FAILED)
+    # have nothing left to reconcile. `resolved_at` alone is not a terminal
+    # signal — only VERIFIED_FIXED sets it, so records like FAILED would
+    # otherwise ping the Devin API on every cron tick for no reason.
+    reconciled = 0
+    skipped = 0
     for rec in store.list_all():
-        if rec.session_id and not rec.resolved_at:
-            await pipeline.reconcile_session(rec)
-            updated += 1
-    return {"reconciled": updated}
+        if not rec.session_id or rec.status.is_terminal():
+            skipped += 1
+            continue
+        await pipeline.reconcile_session(rec)
+        reconciled += 1
+    return {"reconciled": reconciled, "skipped": skipped}
 
 
 @app.get("/stats")

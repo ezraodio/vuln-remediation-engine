@@ -48,8 +48,18 @@ jobs:
           import json, os, re, sys, urllib.request
 
           pr_body = json.loads(os.environ.get("PR_JSON") or "{}").get("body") or ""
+          # Prefer an explicit GitHub "closing keyword" reference (Closes/Fixes/
+          # Resolves #N) over a bare #N mention, since Devin's PR body may
+          # reference unrelated issues in discussion before the closing line.
+          # Falls back to the first bare #N if no closing keyword is found.
           issue_num = None
-          m = re.search(r"#(\d+)", pr_body)
+          m = re.search(
+              r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#(\d+)",
+              pr_body,
+              re.IGNORECASE,
+          )
+          if not m:
+              m = re.search(r"#(\d+)", pr_body)
           if m:
               issue_num = m.group(1)
 

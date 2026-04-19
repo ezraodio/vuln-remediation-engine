@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+import httpx
 from pydantic import BaseModel
 
 from .db import Store
@@ -50,6 +51,13 @@ class Verifier:
             log.warning("verify_report_unknown_key", key=report.dedupe_key)
             return
 
+        logger = log.bind(
+            dedupe_key=report.dedupe_key,
+            rule=rec.finding.rule_id,
+            outcome=report.outcome.value,
+            pr=report.pr_url,
+        )
+        logger.info("verify_report_received")
         self.store.log_event(
             report.dedupe_key,
             "verify_report",
@@ -88,18 +96,34 @@ class Verifier:
                 )
             # Feed the failure back into the running session instead of
             # starting a new one. Devin will see the message and iterate.
+            # Swallow send_message HTTP failures: the session may have been
+            # archived, but we've already persisted VERIFICATION_FAILED above
+            # — we must not 500 the /verify/result endpoint over a best-effort
+            # notification or the scanner workflow will retry a fix-loop that
+            # has already been recorded.
             if rec.session_id:
                 excerpt = (report.scanner_output or "")[:4000]
-                await self.devin.send_message(
-                    rec.session_id,
-                    (
-                        f"Verification re-scan reports that `{rec.finding.rule_id}` is "
-                        f"STILL present on your branch ({report.pr_url}). Please iterate "
-                        f"and push another commit. Scanner output follows:\n\n"
-                        f"```\n{excerpt}\n```"
-                    ),
-                )
+                try:
+                    await self.devin.send_message(
+                        rec.session_id,
+                        (
+                            f"Verification re-scan reports that `{rec.finding.rule_id}` is "
+                            f"STILL present on your branch ({report.pr_url}). Please iterate "
+                            f"and push another commit. Scanner output follows:\n\n"
+                            f"```\n{excerpt}\n```"
+                        ),
+                    )
+                except httpx.HTTPError as e:
+                    logger.warning(
+                        "verify_send_message_failed",
+                        session=rec.session_id,
+                        err=str(e),
+                    )
+                    self.store.log_event(
+                        report.dedupe_key,
+                        "verify_send_message_failed",
+                        {"err": str(e), "session_id": rec.session_id},
+                    )
             return
 
-        # UNKNOWN → just log and move on.
-        log.warning("verify_report_unknown_outcome", key=report.dedupe_key)
+        logger.warning("verify_report_unknown_outcome")

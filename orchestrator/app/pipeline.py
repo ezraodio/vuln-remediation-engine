@@ -1,6 +1,7 @@
 """Core remediation pipeline: ingest → dedupe → route → act → observe."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -109,6 +110,21 @@ class RemediationPipeline:
         self.devin = devin
         self.gh = gh
         self.router = router
+        # Per-key locks serialize concurrent ingests of the same finding so
+        # only one request wins the dedupe race and dispatches Devin. Without
+        # this, two simultaneous POSTs with the same dedupe_key both miss
+        # the local-store read, both miss the GitHub-issue check, and both
+        # dispatch Devin — wasting a session and spawning duplicate work.
+        self._key_locks: dict[str, asyncio.Lock] = {}
+        self._key_locks_guard = asyncio.Lock()
+
+    async def _lock_for(self, key: str) -> asyncio.Lock:
+        async with self._key_locks_guard:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._key_locks[key] = lock
+            return lock
 
     # ------------------------------------------------------------------ #
     # Public entrypoint                                                  #
@@ -116,6 +132,13 @@ class RemediationPipeline:
 
     async def handle_finding(self, finding: Finding, *, source: str) -> IngestResult:
         key = finding.dedupe_key()
+        lock = await self._lock_for(key)
+        async with lock:
+            return await self._handle_finding_locked(finding, key=key, source=source)
+
+    async def _handle_finding_locked(
+        self, finding: Finding, *, key: str, source: str
+    ) -> IngestResult:
         logger = log.bind(
             dedupe_key=key, rule=finding.rule_id, severity=finding.severity.value
         )
@@ -151,6 +174,19 @@ class RemediationPipeline:
                 reason=decision.reason,
             )
 
+        # Dry-run short-circuits *before* any side effects on the target repo:
+        # no issue opened, no Devin session dispatched. This is the whole
+        # point of DRY_RUN=true — inspect what we would do without touching
+        # GitHub or Devin.
+        if self.settings.dry_run:
+            self._record(finding, key, status=RemediationStatus.FILTERED)
+            self.store.log_event(key, "dry_run_skip", {"reason": decision.reason})
+            return IngestResult(
+                dedupe_key=key,
+                status=RemediationStatus.FILTERED,
+                reason="DRY_RUN=true",
+            )
+
         # Create the tracking issue before dispatching so the Devin prompt can
         # reference the issue number (Devin's PR will link back to it).
         issue = await self.gh.create_issue(
@@ -170,15 +206,6 @@ class RemediationPipeline:
             issue_url=issue["html_url"],
         )
         self.store.log_event(key, "issue_created", {"url": issue["html_url"]})
-
-        if self.settings.dry_run:
-            self.store.update_status(key, RemediationStatus.FILTERED)
-            return IngestResult(
-                dedupe_key=key,
-                status=RemediationStatus.FILTERED,
-                reason="DRY_RUN=true",
-                issue_url=issue["html_url"],
-            )
 
         return await self._dispatch_devin(
             finding=finding,
