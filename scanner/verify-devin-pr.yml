@@ -14,6 +14,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  issues: read
 
 concurrency:
   group: verify-devin-${{ github.ref }}
@@ -21,7 +22,6 @@ concurrency:
 
 jobs:
   verify:
-    # Only run when the PR (or a workflow_dispatch) is tied to a remediation.
     if: >
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'devin-remediation') ||
@@ -37,30 +37,55 @@ jobs:
       - name: Install scanners
         run: python -m pip install pip-audit bandit
 
-      - name: Find dedupe_key from PR
-        id: key
-        if: github.event_name == 'pull_request'
+      - name: Load orchestrator metadata from tracking issue
+        id: meta
         env:
-          ISSUE_BODIES: ${{ toJson(github.event.pull_request) }}
-        run: |
-          # The orchestrator embeds the dedupe_key in the tracking issue body.
-          # The PR body usually says "Closes #N" — we dereference the issue.
-          PR_BODY=$(jq -r '.body // ""' <<< "$ISSUE_BODIES")
-          ISSUE_NUM=$(printf "%s" "$PR_BODY" | grep -oE '#[0-9]+' | head -n1 | tr -d '#')
-          if [ -z "$ISSUE_NUM" ]; then
-              echo "No tracking issue referenced in PR body"
-              echo "key=" >> "$GITHUB_OUTPUT"
-              exit 0
-          fi
-          ISSUE_JSON=$(curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUM")
-          KEY=$(jq -r '.body // ""' <<< "$ISSUE_JSON" | grep -oE '`[0-9a-f]{16}`' | head -n1 | tr -d '`')
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-        env:
+          PR_JSON: ${{ toJson(github.event.pull_request) }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FALLBACK_KEY: ${{ inputs.dedupe_key }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys, urllib.request
+
+          pr_body = json.loads(os.environ.get("PR_JSON") or "{}").get("body") or ""
+          issue_num = None
+          m = re.search(r"#(\d+)", pr_body)
+          if m:
+              issue_num = m.group(1)
+
+          meta = {
+              "dedupe_key": os.environ.get("FALLBACK_KEY") or "",
+              "kind": None, "rule_id": None, "file_path": None,
+              "line": None, "package_name": None, "scanner": None,
+          }
+
+          if issue_num:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/issues/{issue_num}",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      issue = json.loads(r.read())
+                  body = issue.get("body") or ""
+                  mm = re.search(r"<!--\s*orchestrator-meta:(\{.*?\})\s*-->", body)
+                  if mm:
+                      meta.update(json.loads(mm.group(1)))
+              except Exception as e:
+                  print(f"Failed to load tracking issue {issue_num}: {e}", file=sys.stderr)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k, v in meta.items():
+                  f.write(f"{k}={v or ''}\n")
+              f.write(f"present={'true' if meta['dedupe_key'] else 'false'}\n")
+          PY
 
       - name: Run scanners on PR branch
         id: rescan
+        if: steps.meta.outputs.present == 'true'
         continue-on-error: true
         run: |
           mkdir -p reports
@@ -74,54 +99,84 @@ jobs:
               pip-audit -r "$req" --format json > "reports/pip-audit_${safe}.json" || true
           done
 
-      - name: POST verification result
+      - name: Decide outcome and POST /verify/result
+        if: steps.meta.outputs.present == 'true'
         env:
           ORCHESTRATOR_URL: ${{ secrets.ORCHESTRATOR_URL }}
           INGEST_SHARED_SECRET: ${{ secrets.INGEST_SHARED_SECRET }}
-          DEDUPE_KEY: ${{ steps.key.outputs.key || inputs.dedupe_key }}
+          DEDUPE_KEY: ${{ steps.meta.outputs.dedupe_key }}
+          RULE_ID: ${{ steps.meta.outputs.rule_id }}
+          KIND: ${{ steps.meta.outputs.kind }}
+          FILE_PATH: ${{ steps.meta.outputs.file_path }}
+          PACKAGE_NAME: ${{ steps.meta.outputs.package_name }}
           PR_URL: ${{ github.event.pull_request.html_url || inputs.pr_url }}
         run: |
-          if [ -z "${DEDUPE_KEY:-}" ]; then
-            echo "No dedupe_key resolved; skipping POST"
-            exit 0
-          fi
           python - <<'PY'
-          import glob, json, os, urllib.request, subprocess
-          key = os.environ.get("DEDUPE_KEY")
-          pr = os.environ.get("PR_URL")
+          import glob, json, os, urllib.request
 
-          # Outcome = STILL_VULNERABLE if bandit reports anything medium+ OR pip-audit reports any vuln.
+          rule = os.environ.get("RULE_ID") or ""
+          kind = os.environ.get("KIND") or ""
+          want_file = (os.environ.get("FILE_PATH") or "").strip()
+          want_pkg = (os.environ.get("PACKAGE_NAME") or "").strip().lower()
+
           outcome = "clean"
           details = []
 
-          try:
-              b = json.load(open("reports/bandit.json"))
-              if b.get("results"):
-                  outcome = "still_vuln"
-                  details.append(f"bandit: {len(b['results'])} findings")
-          except Exception:
-              pass
-
-          for p in glob.glob("reports/pip-audit_*.json"):
+          # SAST: still_vuln iff bandit reports the SAME rule id (and, when
+          # available, in the same file we asked Devin to fix).
+          if kind == "sast":
               try:
-                  d = json.load(open(p))
-                  vul = [x for x in d.get("dependencies", []) if x.get("vulns")]
-                  if vul:
-                      outcome = "still_vuln"
-                      details.append(f"{p}: {sum(len(x['vulns']) for x in vul)} vulns across {len(vul)} packages")
-              except Exception:
-                  pass
+                  b = json.load(open("reports/bandit.json"))
+              except FileNotFoundError:
+                  b = {"results": []}
+              hits = []
+              for r in b.get("results", []):
+                  if r.get("test_id") != rule:
+                      continue
+                  if want_file and r.get("filename") and want_file not in r["filename"]:
+                      continue
+                  hits.append(f"{r.get('filename')}:{r.get('line_number')} {r.get('test_id')}")
+              if hits:
+                  outcome = "still_vuln"
+                  details.append("bandit: " + "; ".join(hits[:10]))
+
+          # Dep CVE: still_vuln iff pip-audit reports the SAME CVE id on the
+          # SAME package we asked Devin to upgrade.
+          if kind == "dep_cve":
+              hits = []
+              for p in glob.glob("reports/pip-audit_*.json"):
+                  try:
+                      d = json.load(open(p))
+                  except Exception:
+                      continue
+                  for dep in d.get("dependencies", []):
+                      if want_pkg and dep.get("name", "").lower() != want_pkg:
+                          continue
+                      for v in dep.get("vulns", []):
+                          if rule and v.get("id") != rule:
+                              continue
+                          hits.append(f"{dep['name']}=={dep.get('version')} {v.get('id')}")
+              if hits:
+                  outcome = "still_vuln"
+                  details.append("pip-audit: " + "; ".join(hits[:10]))
 
           payload = {
-              "dedupe_key": key,
-              "pr_url": pr,
+              "dedupe_key": os.environ["DEDUPE_KEY"],
+              "pr_url": os.environ.get("PR_URL"),
               "outcome": outcome,
-              "scanner_output": "\n".join(details) or "scanner reports clean",
+              "scanner_output": "\n".join(details) or f"{rule} no longer reported",
           }
-          data = json.dumps(payload).encode()
+
+          url = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
+          if not url:
+              print("ORCHESTRATOR_URL unset; printing payload only")
+              print(json.dumps(payload, indent=2))
+              raise SystemExit(0)
+
           req = urllib.request.Request(
-              os.environ["ORCHESTRATOR_URL"].rstrip("/") + "/verify/result",
-              data=data, method="POST",
+              url + "/verify/result",
+              data=json.dumps(payload).encode(),
+              method="POST",
               headers={
                   "Content-Type": "application/json",
                   "X-Ingest-Secret": os.environ["INGEST_SHARED_SECRET"],

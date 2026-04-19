@@ -132,7 +132,7 @@ def test_compute_stats_mttr_percentiles(tmp_store):
 def test_success_rate_math(tmp_store):
     records = [
         _rec(status=RemediationStatus.VERIFIED_FIXED, key_suffix="ok1"),
-        _rec(status=RemediationStatus.RESOLVED, key_suffix="ok2"),
+        _rec(status=RemediationStatus.VERIFIED_FIXED, key_suffix="ok2"),
         _rec(status=RemediationStatus.VERIFICATION_FAILED, key_suffix="fail1"),
         _rec(status=RemediationStatus.FAILED, key_suffix="fail2"),
     ]

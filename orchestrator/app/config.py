@@ -39,21 +39,11 @@ class Settings(BaseSettings):
     # --- Policy ---
     min_cvss: float = Field(7.0, alias="MIN_CVSS")
     min_severity: str = Field("HIGH", alias="MIN_SEVERITY")  # LOW | MEDIUM | HIGH | CRITICAL
-    max_concurrent_sessions: int = Field(5, alias="MAX_CONCURRENT_SESSIONS")
     dry_run: bool = Field(False, alias="DRY_RUN")
     mock_mode: bool = Field(False, alias="MOCK_MODE")
 
-    # Router behavior: what to do for trivial-looking version bumps.
-    # "bump_pr"  -> open version-bump PR directly (no Devin)
-    # "dispatch" -> always dispatch Devin
-    # "skip"     -> skip (Dependabot will handle)
-    bump_strategy: str = Field("dispatch", alias="BUMP_STRATEGY")
-
     # --- Storage ---
     db_path: str = Field("./orchestrator.db", alias="ORCHESTRATOR_DB_PATH")
-
-    # --- Server ---
-    public_base_url: str = Field("http://localhost:8080", alias="PUBLIC_BASE_URL")
 
 
 _settings: Settings | None = None

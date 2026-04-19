@@ -171,7 +171,7 @@ def _sast_prompt(
 ) -> str:
     loc = f"{finding.file_path}:{finding.line}" if finding.file_path else "(unknown)"
     pkg_root = _top_level_pkg(finding.file_path) or "."
-    rescan = f"bandit -r {pkg_root} -ll" if finding.scanner == "bandit" else finding.scanner
+    rescan = _sast_rescan_cmd(finding.scanner, pkg_root)
     test_cmd = "pytest tests/unit_tests/ -x -q"
     branch = f"devin/remediate-{finding.rule_id.lower()}-{_slug(finding.file_path)}"
     return f"""\
@@ -228,3 +228,16 @@ def _top_level_pkg(path: str | None) -> str | None:
         return None
     head = path.split("/", 1)[0]
     return head or None
+
+
+def _sast_rescan_cmd(scanner: str, pkg_root: str) -> str:
+    """Map a scanner id to a runnable re-scan command scoped to `pkg_root`.
+
+    Unknown scanners fall back to the bare scanner name; the acceptance block
+    still demands proof the targeted finding is gone, so Devin will adjust.
+    """
+    if scanner == "bandit":
+        return f"bandit -r {pkg_root} -ll"
+    if scanner == "semgrep":
+        return f"semgrep scan --error {pkg_root}"
+    return scanner

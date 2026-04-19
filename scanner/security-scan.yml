@@ -68,7 +68,23 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           findings = []
 
-          SEV_FROM_CVSS = lambda c: ("CRITICAL" if c>=9 else "HIGH" if c>=7 else "MEDIUM" if c>=4 else "LOW") if c is not None else "MEDIUM"
+          def sev_from_cvss(c):
+              if c is None:
+                  return "MEDIUM"
+              if c >= 9: return "CRITICAL"
+              if c >= 7: return "HIGH"
+              if c >= 4: return "MEDIUM"
+              return "LOW"
+
+          def extract_cvss(v):
+              # pip-audit JSON is heterogeneous; try the common shapes.
+              for key in ("cvss", "cvss_score", "score"):
+                  if isinstance(v.get(key), (int, float)):
+                      return float(v[key])
+              for sev in v.get("severity") or []:
+                  if isinstance(sev, dict) and isinstance(sev.get("score"), (int, float)):
+                      return float(sev["score"])
+              return None
 
           # --- pip-audit ---
           for path in sorted(glob.glob("reports/pip-audit_*.json")):
@@ -79,13 +95,15 @@ jobs:
               manifest = path.replace("reports/pip-audit_", "").replace(".json", "").replace("_", "/")
               for dep in data.get("dependencies", []):
                   for v in dep.get("vulns", []):
-                      sev = "HIGH"  # pip-audit's own json doesn't always carry CVSS
+                      cvss = extract_cvss(v)
+                      sev = sev_from_cvss(cvss)
                       findings.append({
                           "kind": "dep_cve",
                           "repo": repo,
                           "rule_id": v["id"],
                           "title": f"{v['id']} in {dep['name']} {dep['version']}",
                           "severity": sev,
+                          "cvss": cvss,
                           "package_ecosystem": "PyPI",
                           "package_name": dep["name"],
                           "installed_version": dep["version"],

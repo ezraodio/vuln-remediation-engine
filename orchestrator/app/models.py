@@ -105,16 +105,22 @@ class IngestRequest(BaseModel):
 
 
 class RemediationStatus(StrEnum):
-    DEDUPED = "deduped"                # skipped: already tracked
-    FILTERED = "filtered"              # skipped: below severity threshold
-    ROUTED_BUMP_PR = "routed_bump_pr"  # opened a direct bump PR
-    DISPATCHED = "dispatched"          # Devin session launched
+    DEDUPED = "deduped"                        # already tracked; skipped
+    FILTERED = "filtered"                      # below severity/CVSS floor; skipped
+    DISPATCHED = "dispatched"                  # Devin session launched
     SESSION_RUNNING = "session_running"
     PR_OPENED = "pr_opened"
-    VERIFIED_FIXED = "verified_fixed"
+    VERIFIED_FIXED = "verified_fixed"          # terminal success
     VERIFICATION_FAILED = "verification_failed"
-    RESOLVED = "resolved"
-    FAILED = "failed"
+    FAILED = "failed"                          # terminal failure
+
+    def is_terminal(self) -> bool:
+        return self in {
+            RemediationStatus.VERIFIED_FIXED,
+            RemediationStatus.FAILED,
+            RemediationStatus.FILTERED,
+            RemediationStatus.DEDUPED,
+        }
 
 
 class IngestResult(BaseModel):
@@ -157,7 +163,6 @@ class Stats(BaseModel):
     active_sessions: int
     dedupe_hits: int
     prs_opened: int
-    prs_merged: int
     verified_fixed: int
     verification_failed: int
     median_mttr_seconds: float | None

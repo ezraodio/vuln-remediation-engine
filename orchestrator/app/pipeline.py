@@ -1,6 +1,10 @@
 """Core remediation pipeline: ingest → dedupe → route → act → observe."""
 from __future__ import annotations
 
+import json
+
+import httpx
+
 from .config import Settings
 from .db import Store
 from .devin_client import DevinClient
@@ -23,10 +27,14 @@ log = get_logger("pipeline")
 def _issue_body(finding: Finding, dedupe_key: str) -> str:
     """Render the GitHub issue body.
 
-    The dedupe key is embedded as a marker so future scans can find this open
-    issue and skip creating a duplicate.
+    Embeds the dedupe key as a visible marker AND the machine-readable
+    metadata as an HTML comment. The verifier workflow parses the HTML
+    comment so it can filter scanner output down to *this* finding rather
+    than flagging the whole repo as still-vulnerable.
     """
+    meta = _issue_meta_comment(finding, dedupe_key)
     lines = [
+        meta,
         "> Automatically opened by the vulnerability remediation orchestrator.",
         f"> Dedupe key (do not remove): `{dedupe_key}`",
         "",
@@ -58,6 +66,25 @@ def _issue_body(finding: Finding, dedupe_key: str) -> str:
         " posted as comments.",
     ]
     return "\n".join(lines)
+
+
+def _issue_meta_comment(finding: Finding, dedupe_key: str) -> str:
+    """Emit an HTML comment the verifier parses to scope re-scan output.
+
+    The verifier workflow greps for `orchestrator-meta:` and pulls this JSON
+    blob out of the tracking issue body to decide whether a given scanner
+    hit is *this* finding or an unrelated one.
+    """
+    meta = {
+        "dedupe_key": dedupe_key,
+        "kind": finding.kind.value,
+        "rule_id": finding.rule_id,
+        "file_path": finding.file_path,
+        "line": finding.line,
+        "package_name": finding.package_name,
+        "scanner": finding.scanner,
+    }
+    return f"<!-- orchestrator-meta:{json.dumps(meta, separators=(',', ':'))} -->"
 
 
 class RemediationPipeline:
@@ -94,22 +121,20 @@ class RemediationPipeline:
         )
         logger.info("finding_received", scanner=finding.scanner, source=source)
 
-        # 1) Local dedupe via SQLite.
         if (local_hit := self._deduped_locally(key)) is not None:
             logger.info("dedupe_hit_local", status=local_hit.status.value)
             return local_hit
 
-        # 2) Open-issue dedupe (covers restarts where SQLite was dropped).
+        # Open-issue dedupe covers the case where SQLite was dropped but the
+        # GitHub issue still exists — prevents a duplicate from being filed.
         if (issue_hit := await self._deduped_by_issue(finding, key)) is not None:
             logger.info("dedupe_hit_github_issue")
             return issue_hit
 
-        # 3) Active-session dedupe.
         if (session_hit := await self._deduped_by_session(finding, key)) is not None:
             logger.info("dedupe_hit_active_session")
             return session_hit
 
-        # 4) Route.
         decision = self.router.decide(finding)
         logger.info(
             "routing_decision", action=decision.action, reason=decision.reason
@@ -126,7 +151,8 @@ class RemediationPipeline:
                 reason=decision.reason,
             )
 
-        # 5) Create the tracking issue first so the Devin prompt can reference it.
+        # Create the tracking issue before dispatching so the Devin prompt can
+        # reference the issue number (Devin's PR will link back to it).
         issue = await self.gh.create_issue(
             finding.repo,
             title=finding.human_title(),
@@ -154,16 +180,6 @@ class RemediationPipeline:
                 issue_url=issue["html_url"],
             )
 
-        # 6) Note bump-PR fallback (we still dispatch Devin so tests run).
-        if decision.action == "open_bump_pr":
-            await self.gh.comment_issue(
-                finding.repo,
-                issue["number"],
-                f"Router decision: **open_bump_pr** (target `{decision.bump_target}`)."
-                f" Falling back to Devin dispatch so tests run against the bump.",
-            )
-
-        # 7) Dispatch Devin.
         return await self._dispatch_devin(
             finding=finding,
             key=key,
@@ -178,11 +194,11 @@ class RemediationPipeline:
 
     async def reconcile_session(self, rec: RemediationRecord) -> None:
         """Poll Devin to update session state; link PR if one appeared."""
-        if not rec.session_id:
+        if not rec.session_id or rec.status.is_terminal():
             return
         try:
             s = await self.devin.get_session(rec.session_id)
-        except Exception as e:  # noqa: BLE001
+        except httpx.HTTPError as e:
             log.warning(
                 "reconcile_get_session_failed", err=str(e), session=rec.session_id
             )
@@ -200,11 +216,8 @@ class RemediationPipeline:
                     rec.issue_number,
                     f":sparkles: Devin opened PR: {pr_url}",
                 )
-        if (
-            not self.devin.session_is_active(s)
-            and not prs
-            and rec.status != RemediationStatus.FAILED
-        ):
+            return
+        if not self.devin.session_is_active(s) and not prs and not rec.pr_url:
             self.store.update_status(rec.dedupe_key, RemediationStatus.FAILED)
             self.store.log_event(
                 rec.dedupe_key, "session_ended_no_pr", {"status": s.get("status")}
@@ -344,7 +357,7 @@ class RemediationPipeline:
                 ],
                 idempotent=True,
             )
-        except Exception as e:  # noqa: BLE001
+        except httpx.HTTPError as e:
             logger.error("devin_dispatch_failed", err=str(e))
             self.store.update_status(key, RemediationStatus.FAILED)
             self.store.log_event(key, "devin_dispatch_failed", {"err": str(e)})

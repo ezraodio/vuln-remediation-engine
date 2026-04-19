@@ -100,14 +100,29 @@ def test_prompt_covers_false_positive_guidance_for_sast_only():
 
 def test_prompt_respects_base_branch_override():
     p = build_prompt(_sast(), target_repo="o/r", issue_number=1, base_branch="master")
-    assert "master" in p
-    assert "main" not in p.lower().split(" master ")[0].rsplit("main", 0)[-1] or True
-    # Sanity: default-branch fallback (main) should NOT appear when master is passed.
-    # We assert the emitted branch command explicitly references master.
     assert "from `master`" in p
+    # The default-branch fallback must not appear anywhere in the emitted
+    # branch/PR commands when an explicit base_branch is passed.
+    assert "from `main`" not in p
+    assert "against `main`" not in p
 
 
 def test_prompt_closes_issue_reference():
     """`Closes #N` is how we auto-close the tracking issue on PR merge."""
     p = build_prompt(_dep(), target_repo="o/r", issue_number=123)
     assert "Closes #123" in p
+
+
+def test_sast_prompt_uses_bandit_flags_not_bare_scanner_name():
+    """Regression: earlier versions emitted the bare scanner name ("bandit")
+    as the re-scan command, which is not actually runnable."""
+    p = build_prompt(_sast(), target_repo="o/r", issue_number=1)
+    assert "bandit -r" in p
+    assert "-ll" in p
+
+
+def test_semgrep_rescan_is_runnable():
+    f = _sast()
+    f.scanner = "semgrep"
+    p = build_prompt(f, target_repo="o/r", issue_number=1)
+    assert "semgrep scan" in p

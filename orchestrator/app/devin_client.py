@@ -109,15 +109,32 @@ class DevinClient:
         r.raise_for_status()
         return r.json()
 
-    async def list_sessions_by_tag(self, tag: str, *, limit: int = 50) -> list[dict]:
-        """Find sessions whose tags include `tag`. Used for dedupe."""
+    async def list_sessions_by_tag(
+        self, tag: str, *, page_size: int = 50, max_pages: int = 10
+    ) -> list[dict]:
+        """Find sessions whose tags include `tag`. Used for dedupe.
+
+        Pages through results so busy orgs don't silently drop matches off the
+        tail. `max_pages` bounds latency and is a sane cap for dedupe lookups.
+        """
         if self.mock:
             return []
-        r = await self._request("GET", f"/sessions?limit={limit}")
-        if r.status_code != 200:
-            return []
-        items = r.json().get("items", [])
-        return [s for s in items if tag in (s.get("tags") or [])]
+        matches: list[dict] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            path = f"/sessions?limit={page_size}"
+            if cursor:
+                path += f"&cursor={cursor}"
+            r = await self._request("GET", path)
+            if r.status_code != 200:
+                break
+            body = r.json()
+            items = body.get("items", [])
+            matches.extend(s for s in items if tag in (s.get("tags") or []))
+            cursor = body.get("next_cursor") or body.get("cursor") or None
+            if not cursor or not items:
+                break
+        return matches
 
     async def send_message(self, session_id: str, message: str) -> None:
         """Post a message into a running session (used for verification feedback)."""

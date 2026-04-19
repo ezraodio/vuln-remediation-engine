@@ -35,8 +35,7 @@ Target repo in this demo: [`ezraodio/superset`](https://github.com/ezraodio/supe
 4. Surviving findings are **routed**:
    - `SAST` findings → always dispatched to Devin (code judgment required).
    - Dep CVEs with no patched version → Devin (needs first-party mitigation).
-   - Dep CVEs with a trivial patch-level bump → `open_bump_pr` (configurable; default falls back to Devin so tests run against the bump).
-   - Everything else → Devin with a structured prompt.
+   - Dep CVEs with a patched version → Devin with the lowest-fix bump target in the prompt, so Devin upgrades AND re-runs the test suite against the new version.
 5. The orchestrator creates a tracking issue in the target repo with the
    dedupe key embedded in the body and labels like
    `devin-remediation`, `severity:high`.
@@ -44,11 +43,14 @@ Target repo in this demo: [`ezraodio/superset`](https://github.com/ezraodio/supe
    (`vuln:<key>`, `rule:<id>`, `severity:<x>`, `repo:<o/r>`) so subsequent
    dedupe queries are fast.
 7. When Devin opens a PR, `verify-devin-pr.yml` runs the scanner against the
-   PR's branch and POSTs the outcome to `/verify/result`. On `still_vuln` the
-   orchestrator calls `POST /v3/.../sessions/{id}/message` to feed the failing
-   scanner output back into the same Devin session so it iterates instead of
-   spawning a new one. On `clean` the issue is closed and the record
-   transitions to `VERIFIED_FIXED`.
+   PR's branch, reads the orchestrator's metadata out of the tracking issue
+   body, filters scanner output down to *the specific rule/package we asked
+   Devin to fix* (ignoring unrelated pre-existing findings in the target
+   repo), and POSTs the outcome to `/verify/result`. On `still_vuln` the
+   orchestrator calls `POST /v3/.../sessions/{id}/message` to feed the
+   failing scanner output back into the same Devin session so it iterates
+   instead of spawning a new one. On `clean` the issue is closed and the
+   record transitions to `VERIFIED_FIXED`.
 
 ## Why this uses Devin specifically (and not just scripts)
 
@@ -125,7 +127,7 @@ See `.env.example` for the full list. Most important knobs:
 | --- | --- | --- |
 | `MIN_SEVERITY` | `HIGH` | Drops anything strictly below this |
 | `MIN_CVSS` | `7.0` | Still accepts `MEDIUM` findings if CVSS is above this |
-| `BUMP_STRATEGY` | `dispatch` | `dispatch` = always Devin. `bump_pr` = trivial bumps get a direct PR. `skip` = delegate trivial bumps to Dependabot. |
+| `TARGET_BASE_BRANCH` | `main` | Default branch on the target repo (Superset fork uses `master`) |
 | `DRY_RUN` | `false` | Creates issues but does not dispatch Devin |
 | `MOCK_MODE` | `false` | Stubs Devin + GitHub clients for local demos |
 | `INGEST_SHARED_SECRET` | — | Required on `/ingest` and `/verify/result` |
@@ -180,6 +182,6 @@ See `.env.example` for the full list. Most important knobs:
 
 - Optional Dependabot webhook ingress (real-time for graph-level CVEs).
 - Per-repo concurrency caps + an ACU budget guard.
-- Optional `open_bump_pr` path via `gh pr create` without dispatching Devin,
+- Optional direct-bump-PR path (via `gh pr create`) without dispatching Devin,
   for shops that want Dependabot-style behavior for the trivial 80%.
 - Persist metrics to Postgres + Grafana instead of the SQLite + dashboard.

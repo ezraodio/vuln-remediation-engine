@@ -65,7 +65,6 @@ def _build_state(app: FastAPI, settings: Settings) -> None:
     router = Router(
         min_severity=Severity(settings.min_severity),
         min_cvss=settings.min_cvss,
-        bump_strategy=settings.bump_strategy,
     )
     pipeline = RemediationPipeline(
         settings=settings, store=store, devin=devin, gh=gh, router=router

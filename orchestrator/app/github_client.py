@@ -77,6 +77,10 @@ class GitHubClient:
         if r.status_code != 200:
             return None
         for issue in r.json():
+            # GitHub's /issues endpoint returns PRs too; filter them out so we
+            # never dedupe a finding against a PR that happens to quote the key.
+            if issue.get("pull_request"):
+                continue
             body = issue.get("body") or ""
             if marker in body:
                 return issue
