@@ -18,6 +18,7 @@ from app.router import Router
 class _FakeSettings:
     target_repo = "o/r"
     issue_label = "devin-remediation"
+    target_base_branch = "main"
     dry_run = False
     mock_mode = True
 

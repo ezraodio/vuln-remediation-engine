@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     github_token: str = Field("", alias="GITHUB_TOKEN")
     target_repo: str = Field("ezraodio/superset", alias="TARGET_REPO")
     issue_label: str = Field("devin-remediation", alias="ISSUE_LABEL")
+    # Default branch of the target repo. Apache Superset's fork is `master`;
+    # most repos are `main`. Injected into the Devin prompt so Devin branches
+    # from the right base.
+    target_base_branch: str = Field("master", alias="TARGET_BASE_BRANCH")
 
     # --- Webhooks / auth ---
     ingest_shared_secret: str = Field(

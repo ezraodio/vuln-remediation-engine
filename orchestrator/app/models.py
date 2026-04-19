@@ -7,6 +7,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from .time_utils import now_utc
+
 
 class Severity(StrEnum):
     CRITICAL = "CRITICAL"
@@ -69,7 +71,7 @@ class Finding(BaseModel):
     description: str | None = None
     advisory_url: str | None = None
     scanner: str = Field(..., description="pip-audit|bandit|semgrep|npm-audit|osv-scanner|manual")
-    scanned_at: datetime = Field(default_factory=datetime.utcnow)
+    scanned_at: datetime = Field(default_factory=now_utc)
 
     def dedupe_key(self) -> str:
         """Stable hash used for idempotency.

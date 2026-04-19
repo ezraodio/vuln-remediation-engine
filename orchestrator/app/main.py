@@ -1,18 +1,21 @@
 """FastAPI entrypoint for the vulnerability remediation orchestrator.
 
 Endpoints:
-  POST /ingest               - scanner posts findings here
-  POST /verify/result        - verification CI posts re-scan results
-  POST /webhooks/github      - (PRs closed/merged) optional
-  GET  /stats                - machine-readable metrics
-  GET  /dashboard            - HTML dashboard
-  GET  /healthz
-  GET  /                     - redirects to /dashboard
+  POST /ingest          - scanner posts findings here
+  POST /verify/result   - verification CI posts re-scan results
+  POST /reconcile       - force a one-shot reconcile (useful for cron/demos)
+  GET  /stats           - machine-readable metrics
+  GET  /dashboard       - HTML dashboard
+  GET  /events          - recent audit-log events
+  GET  /healthz         - liveness probe
+  GET  /                - redirects to /dashboard
 """
 from __future__ import annotations
 
 import hmac
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
@@ -28,15 +31,24 @@ from .models import IngestRequest, IngestResponse, Severity
 from .observability import compute_stats
 from .pipeline import RemediationPipeline
 from .router import Router
+from .time_utils import now_utc
 from .verifier import Verifier, VerifyReport
 
 log = get_logger("api")
 
-app = FastAPI(title="Vulnerability Remediation Orchestrator", version="0.1.0")
+
+# --------------------------------------------------------------------------- #
+# Lifespan / DI wiring                                                        #
+# --------------------------------------------------------------------------- #
 
 
-def _build_state(settings: Settings) -> None:
-    """Wire up components once on startup and attach to app.state."""
+def _build_state(app: FastAPI, settings: Settings) -> None:
+    """Wire up components on startup and attach to `app.state`.
+
+    Every component has exactly one owner (the FastAPI app), and every
+    component's dependencies are passed in explicitly — no module-level
+    singletons for Store/Devin/GitHub. Makes swapping in test doubles trivial.
+    """
     configure_logging()
     store = Store(settings.db_path)
     devin = DevinClient(
@@ -59,34 +71,54 @@ def _build_state(settings: Settings) -> None:
         settings=settings, store=store, devin=devin, gh=gh, router=router
     )
     verifier = Verifier(store=store, devin=devin, gh=gh)
+
+    templates_dir = Path(__file__).parent / "templates"
+    jinja = Environment(
+        loader=FileSystemLoader(templates_dir),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+
     app.state.settings = settings
     app.state.store = store
     app.state.devin = devin
     app.state.gh = gh
     app.state.pipeline = pipeline
     app.state.verifier = verifier
-
-    templates_dir = Path(__file__).parent / "templates"
-    app.state.jinja = Environment(
-        loader=FileSystemLoader(templates_dir),
-        autoescape=select_autoescape(["html", "xml"]),
-    )
+    app.state.jinja = jinja
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    _build_state(get_settings())
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings = get_settings()
+    _build_state(app, settings)
     log.info(
         "orchestrator_started",
-        target_repo=app.state.settings.target_repo,
-        mock_mode=app.state.settings.mock_mode,
-        min_severity=app.state.settings.min_severity,
+        target_repo=settings.target_repo,
+        mock_mode=settings.mock_mode,
+        min_severity=settings.min_severity,
     )
+    yield
+    log.info("orchestrator_stopped")
 
 
-# -------- auth helper --------
+app = FastAPI(
+    title="Vulnerability Remediation Orchestrator",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Auth                                                                        #
+# --------------------------------------------------------------------------- #
+
 
 def _authz(settings: Settings, provided: str | None) -> None:
+    """Validate the shared-secret header on write endpoints.
+
+    Empty `ingest_shared_secret` disables auth entirely (dev default).
+    Uses `hmac.compare_digest` to avoid timing leaks.
+    """
     expected = settings.ingest_shared_secret
     if not expected:
         return
@@ -94,11 +126,14 @@ def _authz(settings: Settings, provided: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid ingest secret")
 
 
-# -------- endpoints --------
+# --------------------------------------------------------------------------- #
+# Endpoints                                                                   #
+# --------------------------------------------------------------------------- #
+
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "ts": datetime.now(UTC).isoformat()}
+    return {"ok": True, "ts": now_utc().isoformat()}
 
 
 @app.get("/", include_in_schema=False)
@@ -113,17 +148,16 @@ async def ingest(
 ) -> IngestResponse:
     settings: Settings = app.state.settings
     _authz(settings, x_ingest_secret)
-
     pipeline: RemediationPipeline = app.state.pipeline
+
     results = []
     for f in req.findings:
         try:
             r = await pipeline.handle_finding(f, source=req.source)
         except Exception as e:  # noqa: BLE001
             log.exception("handle_finding_failed", rule=f.rule_id, err=str(e))
-            r = None
-        if r is not None:
-            results.append(r)
+            continue
+        results.append(r)
     return IngestResponse(received=len(req.findings), results=results)
 
 
@@ -143,7 +177,11 @@ async def verify_result(
 async def reconcile(
     x_ingest_secret: str | None = Header(default=None, alias="X-Ingest-Secret"),
 ) -> dict:
-    """Force a one-shot reconcile (useful for demos / cron)."""
+    """Force a one-shot reconcile against the Devin API.
+
+    Intended to be invoked by a cron/scheduled workflow so PR-opened events
+    don't have to be pushed back to the orchestrator explicitly.
+    """
     settings: Settings = app.state.settings
     _authz(settings, x_ingest_secret)
     pipeline: RemediationPipeline = app.state.pipeline
@@ -184,9 +222,13 @@ async def events(limit: int = 100) -> dict:
     return {"events": app.state.store.recent_events(limit)}
 
 
-# -------- template helpers --------
+# --------------------------------------------------------------------------- #
+# Template helpers (used by dashboard.html)                                   #
+# --------------------------------------------------------------------------- #
+
 
 def _format_duration(seconds: float | None) -> str:
+    """Pretty-print a duration: 45s, 3m, 2.1h, 1.3d."""
     if seconds is None:
         return "—"
     if seconds < 60:
@@ -199,6 +241,9 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _age(dt: datetime) -> str:
-    now = datetime.utcnow()
-    delta = (now - dt).total_seconds()
-    return _format_duration(delta)
+    """How long ago `dt` was, tolerant of naive vs. aware inputs."""
+    now = now_utc()
+    if dt.tzinfo is None:
+        # Legacy rows persisted before tz-aware timestamps landed.
+        dt = dt.replace(tzinfo=now.tzinfo)
+    return _format_duration((now - dt).total_seconds())

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .models import Finding, RemediationRecord, RemediationStatus
+from .time_utils import now_utc
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS remediations (
@@ -144,7 +145,7 @@ class Store:
             rec.session_url = session_url
         if pr_url is not None:
             rec.pr_url = pr_url
-        now = datetime.utcnow()
+        now = now_utc()
         rec.updated_at = now
         if mark_resolved:
             rec.resolved_at = now
@@ -157,7 +158,7 @@ class Store:
         with self._conn() as c:
             c.execute(
                 "INSERT INTO events (dedupe_key, kind, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (dedupe_key, kind, json.dumps(payload), datetime.utcnow().isoformat()),
+                (dedupe_key, kind, json.dumps(payload), now_utc().isoformat()),
             )
 
     def recent_events(self, limit: int = 50) -> list[dict]:
