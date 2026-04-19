@@ -1,0 +1,137 @@
+"""Devin v3 API client.
+
+Docs: https://docs.devin.ai/api-reference/overview
+Base: https://api.devin.ai/v3/organizations/{org_id}/...
+
+Only the endpoints we actually need:
+  - POST   /sessions               (create)
+  - GET    /sessions               (list, used for dedupe by tag)
+  - GET    /sessions/{id}          (status)
+  - POST   /sessions/{id}/message  (feedback into running session)
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+from .logging_config import get_logger
+
+log = get_logger("devin")
+
+
+class DevinClient:
+    def __init__(
+        self,
+        api_key: str,
+        org_id: str,
+        *,
+        base_url: str = "https://api.devin.ai",
+        timeout: float = 30.0,
+        mock: bool = False,
+    ):
+        self.api_key = api_key
+        self.org_id = org_id
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.mock = mock
+
+    # ---------- internal ----------
+
+    @property
+    def _org_url(self) -> str:
+        return f"{self.base_url}/v3/organizations/{self.org_id}"
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def _request(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        url = f"{self._org_url}{path}"
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            r = await c.request(method, url, headers=self._headers(), **kw)
+        if r.status_code >= 400:
+            log.warning(
+                "devin_api_error",
+                method=method,
+                path=path,
+                status=r.status_code,
+                body=r.text[:500],
+            )
+        return r
+
+    # ---------- public ----------
+
+    async def create_session(
+        self,
+        *,
+        prompt: str,
+        title: str | None = None,
+        tags: list[str] | None = None,
+        idempotent: bool = True,
+        max_acu_limit: int | None = None,
+        create_as_user_id: str | None = None,
+        playbook_id: str | None = None,
+    ) -> dict:
+        """Create a new Devin session.
+
+        Returns {"session_id": "...", "url": "..."} on success.
+        """
+        if self.mock:
+            fake_id = f"mock-{hash(prompt) & 0xFFFFFFFF:x}"
+            return {
+                "session_id": fake_id,
+                "url": f"https://app.devin.ai/sessions/{fake_id}",
+                "is_new_session": True,
+                "mock": True,
+            }
+        body: dict[str, Any] = {"prompt": prompt, "idempotent": idempotent}
+        if title:
+            body["title"] = title
+        if tags:
+            body["tags"] = tags[:50]
+        if max_acu_limit:
+            body["max_acu_limit"] = max_acu_limit
+        if create_as_user_id:
+            body["create_as_user_id"] = create_as_user_id
+        if playbook_id:
+            body["playbook_id"] = playbook_id
+        r = await self._request("POST", "/sessions", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    async def get_session(self, session_id: str) -> dict:
+        if self.mock:
+            return {"session_id": session_id, "status": "running", "pull_requests": []}
+        r = await self._request("GET", f"/sessions/{session_id}")
+        r.raise_for_status()
+        return r.json()
+
+    async def list_sessions_by_tag(self, tag: str, *, limit: int = 50) -> list[dict]:
+        """Find sessions whose tags include `tag`. Used for dedupe."""
+        if self.mock:
+            return []
+        r = await self._request("GET", f"/sessions?limit={limit}")
+        if r.status_code != 200:
+            return []
+        items = r.json().get("items", [])
+        return [s for s in items if tag in (s.get("tags") or [])]
+
+    async def send_message(self, session_id: str, message: str) -> None:
+        """Post a message into a running session (used for verification feedback)."""
+        if self.mock:
+            log.info("mock_devin_send_message", session_id=session_id, message=message[:200])
+            return
+        r = await self._request(
+            "POST", f"/sessions/{session_id}/message", json={"message": message}
+        )
+        r.raise_for_status()
+
+    def session_is_active(self, session: dict) -> bool:
+        """Is the session still doing work? (as opposed to finished/stopped)"""
+        status = (session.get("status") or "").lower()
+        if session.get("is_archived"):
+            return False
+        return status in {"running", "starting", "queued", "pending", "working"}

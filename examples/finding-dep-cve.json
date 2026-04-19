@@ -1,0 +1,22 @@
+{
+  "source": "simulate:manual",
+  "findings": [
+    {
+      "kind": "dep_cve",
+      "repo": "ezraodio/superset",
+      "rule_id": "CVE-2024-47081",
+      "title": "requests: .netrc credential leak via crafted URL",
+      "severity": "HIGH",
+      "cvss": 7.5,
+      "package_ecosystem": "PyPI",
+      "package_name": "requests",
+      "installed_version": "2.32.3",
+      "fixed_versions": ["2.32.4"],
+      "manifest_path": "requirements/base.txt",
+      "advisory_url": "https://github.com/advisories/GHSA-9hjg-9r4m-mvj7",
+      "description": "requests <2.32.4 may leak credentials from the user's .netrc file to third-party origins via crafted URLs.",
+      "scanner": "pip-audit",
+      "scanned_at": "2026-04-19T21:00:00Z"
+    }
+  ]
+}

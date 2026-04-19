@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Vulnerability Remediation Orchestrator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0d10; --fg: #e6e6e6; --muted: #8a94a6; --card: #151922;
+    --border: #242a36; --accent: #6ee7b7; --warn: #fbbf24; --err: #f87171;
+    --info: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .metric { font-size: 28px; font-weight: 600; margin: 4px 0; }
+  .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { background: #1a1f2b; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  tr:last-child td { border-bottom: 0; }
+  a { color: var(--info); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+  .s-CRITICAL { background: #7f1d1d; color: #fecaca; }
+  .s-HIGH { background: #9a3412; color: #fed7aa; }
+  .s-MEDIUM { background: #78350f; color: #fde68a; }
+  .s-LOW, .s-INFO { background: #1e3a8a; color: #bfdbfe; }
+  .st-resolved, .st-verified_fixed { background: #064e3b; color: #6ee7b7; }
+  .st-dispatched, .st-session_running, .st-pr_opened { background: #1e3a8a; color: #93c5fd; }
+  .st-verification_failed, .st-failed { background: #7f1d1d; color: #fecaca; }
+  .st-deduped, .st-filtered { background: #374151; color: #d1d5db; }
+  .st-routed_bump_pr { background: #422006; color: #fed7aa; }
+  code { background: #1a1f2b; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  section { margin-bottom: 24px; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 24px 0 8px; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+  <h1>Vulnerability Remediation Orchestrator</h1>
+  <div class="sub">Target repo: <code>{{ target_repo }}</code> &middot; Dispatched by Devin &middot; Auto-refresh every 10s</div>
+
+  <section>
+    <div class="grid">
+      <div class="card"><div class="label">Total findings</div><div class="metric">{{ stats.total_findings }}</div></div>
+      <div class="card"><div class="label">Active Devin sessions</div><div class="metric">{{ stats.active_sessions }}</div></div>
+      <div class="card"><div class="label">PRs opened</div><div class="metric">{{ stats.prs_opened }}</div></div>
+      <div class="card"><div class="label">Verified fixed</div><div class="metric">{{ stats.verified_fixed }}</div></div>
+      <div class="card"><div class="label">Dedupe hits</div><div class="metric">{{ stats.dedupe_hits }}</div></div>
+      <div class="card"><div class="label">Success rate</div><div class="metric">{% if stats.success_rate is none %}—{% else %}{{ (stats.success_rate * 100) | round(0, 'floor') }}%{% endif %}</div></div>
+      <div class="card"><div class="label">Median MTTR</div><div class="metric">{{ format_duration(stats.median_mttr_seconds) }}</div></div>
+      <div class="card"><div class="label">p90 MTTR</div><div class="metric">{{ format_duration(stats.p90_mttr_seconds) }}</div></div>
+    </div>
+  </section>
+
+  <h2>Remediations</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Severity</th>
+        <th>Finding</th>
+        <th>Status</th>
+        <th>Issue</th>
+        <th>Session</th>
+        <th>PR</th>
+        <th>Age</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in records %}
+      <tr>
+        <td><span class="pill s-{{ r.finding.severity.value }}">{{ r.finding.severity.value }}</span></td>
+        <td>{{ r.finding.human_title() }}<br/><span class="muted">{{ r.finding.scanner }} &middot; <code>{{ r.dedupe_key }}</code></span></td>
+        <td><span class="pill st-{{ r.status.value }}">{{ r.status.value }}</span></td>
+        <td>{% if r.issue_url %}<a href="{{ r.issue_url }}">#{{ r.issue_number }}</a>{% else %}—{% endif %}</td>
+        <td>{% if r.session_url %}<a href="{{ r.session_url }}">{{ r.session_id[:10] }}…</a>{% else %}—{% endif %}</td>
+        <td>{% if r.pr_url %}<a href="{{ r.pr_url }}">PR</a>{% else %}—{% endif %}</td>
+        <td class="muted">{{ age(r.created_at) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="muted">No findings yet. POST to <code>/ingest</code> to create one.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Findings by severity</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Count</th></tr></thead>
+    <tbody>
+      {% for sev, n in stats.by_severity.items() %}
+      <tr><td><span class="pill s-{{ sev }}">{{ sev }}</span></td><td>{{ n }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="footer">
+    Machine-readable metrics: <a href="/stats">/stats</a> &middot; Health: <a href="/healthz">/healthz</a>
+  </div>
+
+  <script>
+    setTimeout(() => location.reload(), 10000);
+  </script>
+</body>
+</html>

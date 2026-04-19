@@ -1,0 +1,151 @@
+name: security-scan
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, print findings without POSTing to orchestrator"
+        default: "false"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pip-audit bandit
+
+      - name: Run pip-audit
+        id: pip_audit
+        continue-on-error: true
+        run: |
+          # Scan every requirements file we find.
+          mkdir -p reports
+          shopt -s nullglob
+          for req in requirements*.txt requirements/*.txt requirements-*.txt; do
+            [ -f "$req" ] || continue
+            safe=$(echo "$req" | tr '/' '_')
+            echo "::group::pip-audit $req"
+            pip-audit -r "$req" --format json > "reports/pip-audit_${safe}.json" || true
+            echo "::endgroup::"
+          done
+          ls reports/ || true
+
+      - name: Run bandit
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          # Scan the default source dir; fall back to current dir.
+          TARGET="superset"
+          [ -d "$TARGET" ] || TARGET="."
+          bandit -r "$TARGET" -ll -f json -o reports/bandit.json --quiet || true
+
+      - name: Normalize + POST to orchestrator
+        env:
+          ORCHESTRATOR_URL: ${{ secrets.ORCHESTRATOR_URL }}
+          INGEST_SHARED_SECRET: ${{ secrets.INGEST_SHARED_SECRET }}
+          TARGET_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          python - <<'PY'
+          import glob, json, os, sys, urllib.request
+          repo = os.environ["TARGET_REPO"]
+          findings = []
+
+          SEV_FROM_CVSS = lambda c: ("CRITICAL" if c>=9 else "HIGH" if c>=7 else "MEDIUM" if c>=4 else "LOW") if c is not None else "MEDIUM"
+
+          # --- pip-audit ---
+          for path in sorted(glob.glob("reports/pip-audit_*.json")):
+              try:
+                  data = json.load(open(path))
+              except Exception:
+                  continue
+              manifest = path.replace("reports/pip-audit_", "").replace(".json", "").replace("_", "/")
+              for dep in data.get("dependencies", []):
+                  for v in dep.get("vulns", []):
+                      sev = "HIGH"  # pip-audit's own json doesn't always carry CVSS
+                      findings.append({
+                          "kind": "dep_cve",
+                          "repo": repo,
+                          "rule_id": v["id"],
+                          "title": f"{v['id']} in {dep['name']} {dep['version']}",
+                          "severity": sev,
+                          "package_ecosystem": "PyPI",
+                          "package_name": dep["name"],
+                          "installed_version": dep["version"],
+                          "fixed_versions": v.get("fix_versions") or [],
+                          "manifest_path": manifest,
+                          "description": v.get("description", ""),
+                          "advisory_url": f"https://osv.dev/vulnerability/{v['id']}",
+                          "scanner": "pip-audit",
+                      })
+
+          # --- bandit ---
+          try:
+              b = json.load(open("reports/bandit.json"))
+          except Exception:
+              b = {"results": []}
+          for r in b.get("results", []):
+              sev = (r.get("issue_severity") or "MEDIUM").upper()
+              if sev == "LOW":
+                  continue
+              findings.append({
+                  "kind": "sast",
+                  "repo": repo,
+                  "rule_id": r["test_id"],
+                  "title": r.get("test_name", "SAST finding"),
+                  "severity": sev,
+                  "file_path": r["filename"],
+                  "line": r.get("line_number"),
+                  "code_excerpt": r.get("code", "").strip()[:500],
+                  "description": r.get("issue_text", ""),
+                  "scanner": "bandit",
+              })
+
+          payload = {"source": f"github-actions:{os.environ.get('GITHUB_RUN_ID','')}", "findings": findings}
+          print(f"Prepared {len(findings)} findings", file=sys.stderr)
+          if os.environ.get("DRY_RUN") == "true" or not os.environ.get("ORCHESTRATOR_URL"):
+              print(json.dumps(payload, indent=2))
+              sys.exit(0)
+
+          data = json.dumps(payload).encode("utf-8")
+          req = urllib.request.Request(
+              os.environ["ORCHESTRATOR_URL"].rstrip("/") + "/ingest",
+              data=data,
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Ingest-Secret": os.environ["INGEST_SHARED_SECRET"],
+              },
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  print(r.read().decode())
+          except Exception as e:
+              print(f"Orchestrator POST failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
+          if-no-files-found: ignore

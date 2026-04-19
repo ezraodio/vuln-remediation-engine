@@ -1,0 +1,19 @@
+{
+  "source": "simulate:manual",
+  "findings": [
+    {
+      "kind": "sast",
+      "repo": "ezraodio/superset",
+      "rule_id": "B506",
+      "title": "yaml.load() without SafeLoader",
+      "severity": "HIGH",
+      "file_path": "superset/examples/utils.py",
+      "line": 261,
+      "code_excerpt": "metadata = yaml.load(contents.get(METADATA_FILE_NAME, \"{}\"), Loader=yaml.Loader)",
+      "description": "yaml.load() with the default Loader (or yaml.Loader) is unsafe and allows arbitrary Python object instantiation via crafted YAML. Use yaml.safe_load() or specify yaml.SafeLoader explicitly. This path in Superset parses metadata from user-supplied example files which could be attacker-controlled.",
+      "advisory_url": "https://bandit.readthedocs.io/en/latest/plugins/b506_yaml_load.html",
+      "scanner": "bandit",
+      "scanned_at": "2026-04-19T21:00:00Z"
+    }
+  ]
+}
