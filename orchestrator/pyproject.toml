@@ -2,7 +2,6 @@
 name = "vuln-remediation-orchestrator"
 version = "0.1.0"
 description = "Event-driven vulnerability remediation engine powered by the Devin API."
-readme = "../README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
