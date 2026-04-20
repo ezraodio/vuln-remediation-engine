@@ -17,11 +17,13 @@ from enum import StrEnum
 import httpx
 from pydantic import BaseModel
 
+from . import metrics
 from .db import Store
 from .devin_client import DevinClient
 from .github_client import GitHubClient
 from .logging_config import get_logger
 from .models import RemediationStatus
+from .time_utils import now_utc
 
 log = get_logger("verifier")
 
@@ -63,6 +65,9 @@ class Verifier:
             "verify_report",
             {"outcome": report.outcome.value, "pr": report.pr_url},
         )
+        metrics.verify_outcomes.labels(outcome=report.outcome.value).inc()
+        latency = (now_utc() - rec.created_at).total_seconds()
+        metrics.verify_latency_seconds.observe(latency)
 
         if report.outcome == VerifyOutcome.CLEAN:
             self.store.update_status(
@@ -71,6 +76,7 @@ class Verifier:
                 pr_url=report.pr_url,
                 mark_resolved=True,
             )
+            metrics.mttr_seconds.observe(latency)
             if rec.issue_number:
                 await self.gh.comment_issue(
                     rec.finding.repo,

@@ -13,21 +13,24 @@ Endpoints:
 from __future__ import annotations
 
 import hmac
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from . import metrics
 from .config import Settings, get_settings
 from .db import Store
 from .devin_client import DevinClient
 from .github_client import GitHubClient
 from .logging_config import configure_logging, get_logger
-from .models import IngestRequest, IngestResponse, Severity
+from .models import IngestRequest, IngestResponse, RemediationStatus, Severity
 from .observability import compute_stats
 from .pipeline import RemediationPipeline
 from .router import Router
@@ -144,17 +147,34 @@ async def root() -> RedirectResponse:
 async def ingest(
     req: IngestRequest,
     x_ingest_secret: str | None = Header(default=None, alias="X-Ingest-Secret"),
+    x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
 ) -> IngestResponse:
     settings: Settings = app.state.settings
     _authz(settings, x_ingest_secret)
     pipeline: RemediationPipeline = app.state.pipeline
 
+    # One request_id spans every finding in this ingest call so a single grep
+    # traces the whole run (orchestrator logs → Devin session tag → tracking
+    # issue body → verify workflow). Callers may pin their own via header for
+    # cross-system correlation with the scanner's CI run.
+    request_id = x_request_id or uuid.uuid4().hex
+    log.info(
+        "ingest_received", request_id=request_id, source=req.source, count=len(req.findings)
+    )
+
     results = []
     for f in req.findings:
         try:
-            r = await pipeline.handle_finding(f, source=req.source)
+            r = await pipeline.handle_finding(
+                f, source=req.source, request_id=request_id
+            )
         except Exception as e:  # noqa: BLE001
-            log.exception("handle_finding_failed", rule=f.rule_id, err=str(e))
+            log.exception(
+                "handle_finding_failed",
+                rule=f.rule_id,
+                err=str(e),
+                request_id=request_id,
+            )
             continue
         results.append(r)
     return IngestResponse(received=len(req.findings), results=results)
@@ -202,14 +222,14 @@ async def reconcile(
 
 @app.get("/stats")
 async def stats_endpoint() -> dict:
-    return compute_stats(app.state.store).model_dump()
+    return compute_stats(app.state.store, app.state.settings).model_dump()
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard() -> HTMLResponse:
     store: Store = app.state.store
     settings: Settings = app.state.settings
-    stats = compute_stats(store)
+    stats = compute_stats(store, settings)
     records = store.list_all()
     env: Environment = app.state.jinja
     template = env.get_template("dashboard.html")
@@ -219,13 +239,58 @@ async def dashboard() -> HTMLResponse:
         target_repo=settings.target_repo,
         format_duration=_format_duration,
         age=_age,
+        is_stale_pr=lambda r: _is_stale_pr(r, settings),
     )
     return HTMLResponse(html)
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus scrape endpoint.
+
+    Refreshes the point-in-time gauges (active_sessions, needs_attention,
+    stale_prs) from the store on each scrape so they reflect the world now
+    rather than the last ingest/reconcile.
+    """
+    store: Store = app.state.store
+    settings: Settings = app.state.settings
+    _refresh_gauges(store, settings)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/events")
 async def events(limit: int = 100) -> dict:
     return {"events": app.state.store.recent_events(limit)}
+
+
+def _refresh_gauges(store: Store, settings: Settings) -> None:
+    active = 0
+    needs_attn = 0
+    stale = 0
+    now = now_utc()
+    warn_hours = settings.stale_pr_warn_hours
+    for r in store.list_all():
+        if r.status in {
+            RemediationStatus.DISPATCHED,
+            RemediationStatus.SESSION_RUNNING,
+        }:
+            active += 1
+        if r.status == RemediationStatus.NEEDS_ATTENTION:
+            needs_attn += 1
+        if r.status == RemediationStatus.PR_OPENED:
+            age_hours = (now - r.updated_at).total_seconds() / 3600
+            if age_hours >= warn_hours:
+                stale += 1
+    metrics.active_sessions.set(active)
+    metrics.needs_attention_gauge.set(needs_attn)
+    metrics.stale_prs_gauge.set(stale)
+
+
+def _is_stale_pr(rec, settings: Settings) -> bool:
+    if rec.status != RemediationStatus.PR_OPENED:
+        return False
+    age_hours = (now_utc() - rec.updated_at).total_seconds() / 3600
+    return age_hours >= settings.stale_pr_warn_hours
 
 
 # --------------------------------------------------------------------------- #

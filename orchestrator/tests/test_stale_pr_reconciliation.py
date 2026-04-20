@@ -1,0 +1,110 @@
+"""Tests for the stale-PR reconciler.
+
+Exercises the four transitions `_reconcile_stale_pr` is responsible for:
+merged → MERGED_UNVERIFIED, closed → HUMAN_REJECTED, open+aged →
+NEEDS_ATTENTION, and the no-op case for PRs that are still fresh.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+
+from app.models import RemediationRecord, RemediationStatus, Severity
+from app.pipeline import RemediationPipeline
+from app.router import Router
+from app.time_utils import now_utc
+
+from .conftest import FakeSettings, make_sast_finding
+
+
+def _pipeline(store, devin, gh):
+    router = Router(min_severity=Severity.HIGH, min_cvss=7.0)
+    return RemediationPipeline(
+        settings=FakeSettings(), store=store, devin=devin, gh=gh, router=router
+    )
+
+
+def _pr_opened_record(store, *, age_hours: float):
+    f = make_sast_finding()
+    now = now_utc()
+    past = now - timedelta(hours=age_hours)
+    rec = RemediationRecord(
+        dedupe_key=f.dedupe_key(),
+        finding=f,
+        status=RemediationStatus.PR_OPENED,
+        session_id="sess-1",
+        issue_number=1,
+        pr_url="https://github.com/o/r/pull/7",
+        created_at=past,
+        updated_at=past,
+    )
+    store.upsert(rec)
+    return rec
+
+
+async def _fake_active_session(*_a, **_kw):
+    return {"session_id": "sess-1", "status": "running", "pull_requests": []}
+
+
+async def test_merged_pr_transitions_to_merged_unverified(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    rec = _pr_opened_record(tmp_store, age_hours=30)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "closed", "merged": True}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    out = tmp_store.get(rec.dedupe_key)
+    assert out.status == RemediationStatus.MERGED_UNVERIFIED
+    assert out.resolved_at is not None
+
+
+async def test_closed_without_merge_transitions_to_human_rejected(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    rec = _pr_opened_record(tmp_store, age_hours=30)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "closed", "merged": False}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    out = tmp_store.get(rec.dedupe_key)
+    assert out.status == RemediationStatus.HUMAN_REJECTED
+    assert out.resolved_at is not None
+
+
+async def test_open_past_flag_threshold_transitions_to_needs_attention(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    rec = _pr_opened_record(tmp_store, age_hours=72)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "open", "merged": False}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    assert tmp_store.get(rec.dedupe_key).status == RemediationStatus.NEEDS_ATTENTION
+
+
+async def test_fresh_open_pr_stays_in_pr_opened(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    # Under the warn threshold — dashboard shouldn't flag it yet either.
+    rec = _pr_opened_record(tmp_store, age_hours=1)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "open", "merged": False}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    assert tmp_store.get(rec.dedupe_key).status == RemediationStatus.PR_OPENED

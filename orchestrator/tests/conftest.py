@@ -26,6 +26,10 @@ class FakeSettings:
     dry_run = False
     mock_mode = True
     ingest_shared_secret = ""
+    stale_pr_warn_hours = 24.0
+    stale_pr_flag_hours = 48.0
+    acu_usd_rate = 0.0
+    baseline_hours_per_finding = 2.0
 
 
 @pytest.fixture

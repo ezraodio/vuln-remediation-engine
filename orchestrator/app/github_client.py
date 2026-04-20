@@ -1,6 +1,7 @@
 """Minimal GitHub REST client for issues, labels, comments and PR lookup."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -9,6 +10,10 @@ from .logging_config import get_logger
 from .retry import with_retry
 
 log = get_logger("github")
+
+_PR_URL_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
+)
 
 
 class GitHubClient:
@@ -193,3 +198,28 @@ class GitHubClient:
             if needle in (pr.get("title") or "") or needle in (pr.get("body") or ""):
                 return pr
         return None
+
+    async def get_pr_state(self, pr_url: str) -> dict | None:
+        """Fetch a PR's state given its html_url.
+
+        Returns ``{"state": "open"|"closed", "merged": bool}`` or ``None`` if
+        the URL isn't parseable or the fetch fails. Used by the stale-PR
+        reconciler to decide whether a long-open PR was merged, rejected, or
+        is still genuinely pending review.
+        """
+        if self.mock:
+            return None
+        m = _PR_URL_RE.match(pr_url or "")
+        if not m:
+            return None
+        owner, repo, number = m.group("owner"), m.group("repo"), m.group("number")
+        r = await self._req(
+            "GET", f"/repos/{owner}/{repo}/pulls/{number}", retry=True
+        )
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        return {
+            "state": body.get("state"),
+            "merged": bool(body.get("merged")),
+        }

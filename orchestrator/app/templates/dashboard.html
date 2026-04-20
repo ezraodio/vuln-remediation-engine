@@ -16,8 +16,13 @@
   .sub { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card.warn { border-color: var(--warn); }
   .metric { font-size: 28px; font-weight: 600; margin: 4px 0; }
+  .metric.warn { color: var(--warn); }
+  .metric.err { color: var(--err); }
+  .metric.ok { color: var(--accent); }
   .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
   table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
   th { background: #1a1f2b; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -29,10 +34,17 @@
   .s-HIGH { background: #9a3412; color: #fed7aa; }
   .s-MEDIUM { background: #78350f; color: #fde68a; }
   .s-LOW, .s-INFO { background: #1e3a8a; color: #bfdbfe; }
-  .st-verified_fixed { background: #064e3b; color: #6ee7b7; }
+  .st-verified_fixed, .st-merged_unverified { background: #064e3b; color: #6ee7b7; }
   .st-dispatched, .st-session_running, .st-pr_opened { background: #1e3a8a; color: #93c5fd; }
-  .st-verification_failed, .st-failed { background: #7f1d1d; color: #fecaca; }
+  .st-verification_failed, .st-failed, .st-human_rejected { background: #7f1d1d; color: #fecaca; }
+  .st-needs_attention { background: #78350f; color: #fde68a; }
   .st-deduped, .st-filtered { background: #374151; color: #d1d5db; }
+  .badge-stale { display: inline-block; margin-left: 6px; padding: 1px 6px; font-size: 10px; font-weight: 600; color: #fde68a; background: #78350f; border-radius: 4px; }
+  .heat { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; min-width: 48px; text-align: center; }
+  .heat-hi { background: #064e3b; color: #6ee7b7; }
+  .heat-mid { background: #78350f; color: #fde68a; }
+  .heat-lo { background: #7f1d1d; color: #fecaca; }
+  .heat-na { background: #374151; color: #d1d5db; }
   code { background: #1a1f2b; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
   section { margin-bottom: 24px; }
   h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 24px 0 8px; }
@@ -49,13 +61,84 @@
       <div class="card"><div class="label">Total findings</div><div class="metric">{{ stats.total_findings }}</div></div>
       <div class="card"><div class="label">Active Devin sessions</div><div class="metric">{{ stats.active_sessions }}</div></div>
       <div class="card"><div class="label">PRs opened</div><div class="metric">{{ stats.prs_opened }}</div></div>
-      <div class="card"><div class="label">Verified fixed</div><div class="metric">{{ stats.verified_fixed }}</div></div>
+      <div class="card"><div class="label">Verified fixed</div><div class="metric ok">{{ stats.verified_fixed }}</div></div>
+      <div class="card {% if stats.needs_attention > 0 %}warn{% endif %}">
+        <div class="label">Needs attention</div>
+        <div class="metric {% if stats.needs_attention > 0 %}warn{% endif %}">{{ stats.needs_attention }}</div>
+        <div class="hint">Stale PRs + flagged rows</div>
+      </div>
       <div class="card"><div class="label">Dedupe hits</div><div class="metric">{{ stats.dedupe_hits }}</div></div>
       <div class="card"><div class="label">Success rate</div><div class="metric">{% if stats.success_rate is none %}—{% else %}{{ (stats.success_rate * 100) | round(0, 'floor') }}%{% endif %}</div></div>
       <div class="card"><div class="label">Median MTTR</div><div class="metric">{{ format_duration(stats.median_mttr_seconds) }}</div></div>
-      <div class="card"><div class="label">p90 MTTR</div><div class="metric">{{ format_duration(stats.p90_mttr_seconds) }}</div></div>
     </div>
   </section>
+
+  <h2>Cost & ROI</h2>
+  <section>
+    <div class="grid">
+      <div class="card">
+        <div class="label">Total ACUs spent</div>
+        <div class="metric">{{ stats.total_acus_spent }}</div>
+        {% if stats.total_usd_spent is not none %}<div class="hint">${{ stats.total_usd_spent }}</div>{% endif %}
+      </div>
+      <div class="card">
+        <div class="label">ACUs per fix</div>
+        <div class="metric">{% if stats.acu_per_fix is none %}—{% else %}{{ stats.acu_per_fix }}{% endif %}</div>
+        {% if stats.usd_per_fix is not none %}<div class="hint">${{ stats.usd_per_fix }}/fix</div>{% endif %}
+      </div>
+      <div class="card">
+        <div class="label">Hours saved (est.)</div>
+        <div class="metric ok">{{ stats.hours_saved_estimate }}h</div>
+        <div class="hint">Baseline × triaged findings</div>
+      </div>
+      <div class="card">
+        <div class="label">p90 MTTR</div>
+        <div class="metric">{{ format_duration(stats.p90_mttr_seconds) }}</div>
+      </div>
+    </div>
+  </section>
+
+  <h2>Per-rule performance</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Rule</th>
+        <th>Total</th>
+        <th>Fixed</th>
+        <th>Failed</th>
+        <th>In-flight</th>
+        <th>Success rate</th>
+        <th>Median MTTR</th>
+        <th>Avg ACUs</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for rp in stats.by_rule %}
+      <tr>
+        <td><code>{{ rp.rule_id }}</code></td>
+        <td>{{ rp.total }}</td>
+        <td>{{ rp.verified_fixed }}</td>
+        <td>{{ rp.failed }}</td>
+        <td>{{ rp.in_flight }}</td>
+        <td>
+          {% if rp.success_rate is none %}
+            <span class="heat heat-na">—</span>
+          {% elif rp.success_rate >= 0.8 %}
+            <span class="heat heat-hi">{{ (rp.success_rate * 100) | round(0, 'floor') }}%</span>
+          {% elif rp.success_rate >= 0.5 %}
+            <span class="heat heat-mid">{{ (rp.success_rate * 100) | round(0, 'floor') }}%</span>
+          {% else %}
+            <span class="heat heat-lo">{{ (rp.success_rate * 100) | round(0, 'floor') }}%</span>
+          {% endif %}
+        </td>
+        <td>{{ format_duration(rp.median_mttr_seconds) }}</td>
+        <td>{% if rp.avg_acu_cost is none %}—{% else %}{{ rp.avg_acu_cost }}{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="muted">No rules observed yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
 
   <h2>Remediations</h2>
   <table>
@@ -67,6 +150,7 @@
         <th>Issue</th>
         <th>Session</th>
         <th>PR</th>
+        <th>ACUs</th>
         <th>Age</th>
       </tr>
     </thead>
@@ -75,14 +159,18 @@
       <tr>
         <td><span class="pill s-{{ r.finding.severity.value }}">{{ r.finding.severity.value }}</span></td>
         <td>{{ r.finding.human_title() }}<br/><span class="muted">{{ r.finding.scanner }} &middot; <code>{{ r.dedupe_key }}</code></span></td>
-        <td><span class="pill st-{{ r.status.value }}">{{ r.status.value }}</span></td>
+        <td>
+          <span class="pill st-{{ r.status.value }}">{{ r.status.value }}</span>
+          {% if is_stale_pr(r) %}<span class="badge-stale">STALE</span>{% endif %}
+        </td>
         <td>{% if r.issue_url %}<a href="{{ r.issue_url }}">#{{ r.issue_number }}</a>{% else %}—{% endif %}</td>
         <td>{% if r.session_url %}<a href="{{ r.session_url }}">{{ r.session_id[:10] }}…</a>{% else %}—{% endif %}</td>
         <td>{% if r.pr_url %}<a href="{{ r.pr_url }}">PR</a>{% else %}—{% endif %}</td>
+        <td>{% if r.acu_cost is none %}—{% else %}{{ r.acu_cost }}{% endif %}</td>
         <td class="muted">{{ age(r.created_at) }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="muted">No findings yet. POST to <code>/ingest</code> to create one.</td></tr>
+      <tr><td colspan="8" class="muted">No findings yet. POST to <code>/ingest</code> to create one.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -98,7 +186,9 @@
   </table>
 
   <div class="footer">
-    Machine-readable metrics: <a href="/stats">/stats</a> &middot; Health: <a href="/healthz">/healthz</a>
+    Machine-readable metrics: <a href="/stats">/stats</a> &middot;
+    Prometheus: <a href="/metrics">/metrics</a> &middot;
+    Health: <a href="/healthz">/healthz</a>
   </div>
 
   <script>

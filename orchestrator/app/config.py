@@ -45,6 +45,23 @@ class Settings(BaseSettings):
     # --- Storage ---
     db_path: str = Field("./orchestrator.db", alias="ORCHESTRATOR_DB_PATH")
 
+    # --- Stale-PR reconciler thresholds ---
+    # A Devin PR that sits in PR_OPENED for longer than `stale_pr_warn_hours`
+    # is flagged for human attention on the dashboard; after
+    # `stale_pr_flag_hours` it is transitioned to NEEDS_ATTENTION so the
+    # operator has an explicit signal that the state machine is stuck.
+    stale_pr_warn_hours: float = Field(24.0, alias="STALE_PR_WARN_HOURS")
+    stale_pr_flag_hours: float = Field(48.0, alias="STALE_PR_FLAG_HOURS")
+
+    # --- Cost / ROI reporting ---
+    # When set, the dashboard derives USD spend from ACUs. Left 0 (default),
+    # the dashboard shows ACUs only, since $/ACU depends on the caller's
+    # Devin plan and hardcoding a number would be misleading.
+    acu_usd_rate: float = Field(0.0, alias="ACU_USD_RATE")
+    # Baseline human-hours to triage one finding, used solely for the
+    # "hours saved" rollup on the dashboard. Conservative default.
+    baseline_hours_per_finding: float = Field(2.0, alias="BASELINE_HOURS_PER_FINDING")
+
 
 _settings: Settings | None = None
 

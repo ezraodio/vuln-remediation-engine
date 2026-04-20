@@ -160,6 +160,9 @@ class RemediationStatus(StrEnum):
     DISPATCHED = "dispatched"                  # Devin session launched
     SESSION_RUNNING = "session_running"
     PR_OPENED = "pr_opened"
+    NEEDS_ATTENTION = "needs_attention"        # PR sat open too long — human intervention
+    MERGED_UNVERIFIED = "merged_unverified"    # PR merged without a verify signal
+    HUMAN_REJECTED = "human_rejected"          # PR closed without merge — terminal
     VERIFIED_FIXED = "verified_fixed"          # terminal success
     VERIFICATION_FAILED = "verification_failed"
     FAILED = "failed"                          # terminal failure
@@ -167,6 +170,8 @@ class RemediationStatus(StrEnum):
     def is_terminal(self) -> bool:
         return self in {
             RemediationStatus.VERIFIED_FIXED,
+            RemediationStatus.MERGED_UNVERIFIED,
+            RemediationStatus.HUMAN_REJECTED,
             RemediationStatus.FAILED,
             RemediationStatus.FILTERED,
             RemediationStatus.DEDUPED,
@@ -199,9 +204,24 @@ class RemediationRecord(BaseModel):
     session_id: str | None = None
     session_url: str | None = None
     pr_url: str | None = None
+    request_id: str | None = None
+    acu_cost: float | None = None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
+
+
+class RulePerformance(BaseModel):
+    """Per-rule success/cost rollup for the dashboard heatmap."""
+
+    rule_id: str
+    total: int
+    verified_fixed: int
+    failed: int
+    in_flight: int
+    success_rate: float | None
+    median_mttr_seconds: float | None
+    avg_acu_cost: float | None
 
 
 class Stats(BaseModel):
@@ -215,6 +235,13 @@ class Stats(BaseModel):
     prs_opened: int
     verified_fixed: int
     verification_failed: int
+    needs_attention: int
     median_mttr_seconds: float | None
     p90_mttr_seconds: float | None
     success_rate: float | None
+    total_acus_spent: float
+    acu_per_fix: float | None
+    total_usd_spent: float | None
+    usd_per_fix: float | None
+    hours_saved_estimate: float
+    by_rule: list[RulePerformance]

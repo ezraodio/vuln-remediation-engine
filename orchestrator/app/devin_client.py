@@ -178,3 +178,21 @@ class DevinClient:
         if session.get("is_archived"):
             return False
         return status in {"running", "starting", "queued", "pending", "working"}
+
+    @staticmethod
+    def session_acu_cost(session: dict) -> float | None:
+        """Extract ACU spend from a session payload, tolerating field drift.
+
+        The v3 API has surfaced the cost field under a handful of names across
+        releases (acu_cost, total_acus, acus_consumed). Check each so a rename
+        upstream doesn't silently zero out our cost dashboard.
+        """
+        for key in ("acu_cost", "total_acus", "acus_consumed", "acus"):
+            v = session.get(key)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None

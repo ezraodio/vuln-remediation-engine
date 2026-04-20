@@ -4,6 +4,7 @@ Kept tiny and schema-manual on purpose — no ORM dependency.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -24,6 +25,8 @@ CREATE TABLE IF NOT EXISTS remediations (
     session_id TEXT,
     session_url TEXT,
     pr_url TEXT,
+    request_id TEXT,
+    acu_cost REAL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     resolved_at TEXT
@@ -43,6 +46,11 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_key ON events(dedupe_key);
 """
 
+_MIGRATIONS = (
+    "ALTER TABLE remediations ADD COLUMN request_id TEXT",
+    "ALTER TABLE remediations ADD COLUMN acu_cost REAL",
+)
+
 
 class Store:
     """Thin synchronous SQLite wrapper.
@@ -56,6 +64,11 @@ class Store:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            for stmt in _MIGRATIONS:
+                # Column already exists on upgrades; SQLite lacks IF NOT EXISTS
+                # for ADD COLUMN, so we swallow the "duplicate column" error.
+                with contextlib.suppress(sqlite3.OperationalError):
+                    c.execute(stmt)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -83,9 +96,9 @@ class Store:
                 """
                 INSERT INTO remediations (
                     dedupe_key, finding_json, status, issue_number, issue_url,
-                    session_id, session_url, pr_url,
+                    session_id, session_url, pr_url, request_id, acu_cost,
                     created_at, updated_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dedupe_key) DO UPDATE SET
                     finding_json=excluded.finding_json,
                     status=excluded.status,
@@ -94,6 +107,8 @@ class Store:
                     session_id=COALESCE(excluded.session_id, remediations.session_id),
                     session_url=COALESCE(excluded.session_url, remediations.session_url),
                     pr_url=COALESCE(excluded.pr_url, remediations.pr_url),
+                    request_id=COALESCE(excluded.request_id, remediations.request_id),
+                    acu_cost=COALESCE(excluded.acu_cost, remediations.acu_cost),
                     updated_at=excluded.updated_at,
                     resolved_at=COALESCE(excluded.resolved_at, remediations.resolved_at)
                 """,
@@ -106,6 +121,8 @@ class Store:
                     record.session_id,
                     record.session_url,
                     record.pr_url,
+                    record.request_id,
+                    record.acu_cost,
                     record.created_at.isoformat(),
                     record.updated_at.isoformat(),
                     record.resolved_at.isoformat() if record.resolved_at else None,
@@ -129,6 +146,8 @@ class Store:
         session_id: str | None = None,
         session_url: str | None = None,
         pr_url: str | None = None,
+        request_id: str | None = None,
+        acu_cost: float | None = None,
         mark_resolved: bool = False,
     ) -> RemediationRecord | None:
         rec = self.get(dedupe_key)
@@ -145,6 +164,10 @@ class Store:
             rec.session_url = session_url
         if pr_url is not None:
             rec.pr_url = pr_url
+        if request_id is not None:
+            rec.request_id = request_id
+        if acu_cost is not None:
+            rec.acu_cost = acu_cost
         now = now_utc()
         rec.updated_at = now
         if mark_resolved:
@@ -180,6 +203,7 @@ class Store:
 
 def _row_to_record(row: sqlite3.Row) -> RemediationRecord:
     finding_data = json.loads(row["finding_json"])
+    keys = row.keys()
     return RemediationRecord(
         dedupe_key=row["dedupe_key"],
         finding=Finding.model_validate(finding_data),
@@ -189,6 +213,8 @@ def _row_to_record(row: sqlite3.Row) -> RemediationRecord:
         session_id=row["session_id"],
         session_url=row["session_url"],
         pr_url=row["pr_url"],
+        request_id=row["request_id"] if "request_id" in keys else None,
+        acu_cost=row["acu_cost"] if "acu_cost" in keys else None,
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,

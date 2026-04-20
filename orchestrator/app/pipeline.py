@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 
 import httpx
 
+from . import metrics
 from .config import Settings
 from .db import Store
 from .devin_client import DevinClient
@@ -25,7 +27,7 @@ from .time_utils import now_utc
 log = get_logger("pipeline")
 
 
-def _issue_body(finding: Finding, dedupe_key: str) -> str:
+def _issue_body(finding: Finding, dedupe_key: str, request_id: str) -> str:
     """Render the GitHub issue body.
 
     Embeds the dedupe key as a visible marker AND the machine-readable
@@ -33,11 +35,12 @@ def _issue_body(finding: Finding, dedupe_key: str) -> str:
     comment so it can filter scanner output down to *this* finding rather
     than flagging the whole repo as still-vulnerable.
     """
-    meta = _issue_meta_comment(finding, dedupe_key)
+    meta = _issue_meta_comment(finding, dedupe_key, request_id)
     lines = [
         meta,
         "> Automatically opened by the vulnerability remediation orchestrator.",
         f"> Dedupe key (do not remove): `{dedupe_key}`",
+        f"> Request ID: `{request_id}`",
         "",
         f"**Rule:** `{finding.rule_id}`",
         f"**Severity:** {finding.severity.value}"
@@ -69,7 +72,7 @@ def _issue_body(finding: Finding, dedupe_key: str) -> str:
     return "\n".join(lines)
 
 
-def _issue_meta_comment(finding: Finding, dedupe_key: str) -> str:
+def _issue_meta_comment(finding: Finding, dedupe_key: str, request_id: str) -> str:
     """Emit an HTML comment the verifier parses to scope re-scan output.
 
     The verifier workflow greps for `orchestrator-meta:` and pulls this JSON
@@ -78,6 +81,7 @@ def _issue_meta_comment(finding: Finding, dedupe_key: str) -> str:
     """
     meta = {
         "dedupe_key": dedupe_key,
+        "request_id": request_id,
         "kind": finding.kind.value,
         "rule_id": finding.rule_id,
         "file_path": finding.file_path,
@@ -130,32 +134,49 @@ class RemediationPipeline:
     # Public entrypoint                                                  #
     # ------------------------------------------------------------------ #
 
-    async def handle_finding(self, finding: Finding, *, source: str) -> IngestResult:
+    async def handle_finding(
+        self, finding: Finding, *, source: str, request_id: str | None = None
+    ) -> IngestResult:
+        # Callers that don't supply a request_id (e.g. scripted backfills,
+        # tests) still get correlation coverage via a freshly minted UUID so
+        # every finding ends up with one.
+        rid = request_id or uuid.uuid4().hex
         key = finding.dedupe_key()
         lock = await self._lock_for(key)
         async with lock:
-            return await self._handle_finding_locked(finding, key=key, source=source)
+            return await self._handle_finding_locked(
+                finding, key=key, source=source, request_id=rid
+            )
 
     async def _handle_finding_locked(
-        self, finding: Finding, *, key: str, source: str
+        self, finding: Finding, *, key: str, source: str, request_id: str
     ) -> IngestResult:
         logger = log.bind(
-            dedupe_key=key, rule=finding.rule_id, severity=finding.severity.value
+            dedupe_key=key,
+            rule=finding.rule_id,
+            severity=finding.severity.value,
+            request_id=request_id,
         )
         logger.info("finding_received", scanner=finding.scanner, source=source)
+        metrics.findings_ingested.labels(
+            kind=finding.kind.value, severity=finding.severity.value
+        ).inc()
 
         if (local_hit := self._deduped_locally(key)) is not None:
             logger.info("dedupe_hit_local", status=local_hit.status.value)
+            metrics.findings_deduped.labels(layer="local").inc()
             return local_hit
 
         # Open-issue dedupe covers the case where SQLite was dropped but the
         # GitHub issue still exists — prevents a duplicate from being filed.
         if (issue_hit := await self._deduped_by_issue(finding, key)) is not None:
             logger.info("dedupe_hit_github_issue")
+            metrics.findings_deduped.labels(layer="github_issue").inc()
             return issue_hit
 
         if (session_hit := await self._deduped_by_session(finding, key)) is not None:
             logger.info("dedupe_hit_active_session")
+            metrics.findings_deduped.labels(layer="active_session").inc()
             return session_hit
 
         decision = self.router.decide(finding)
@@ -165,9 +186,10 @@ class RemediationPipeline:
 
         if decision.action == "skip":
             self._record(
-                finding, key, status=RemediationStatus.FILTERED
+                finding, key, status=RemediationStatus.FILTERED, request_id=request_id
             )
             self.store.log_event(key, "filtered", {"reason": decision.reason})
+            metrics.findings_filtered.labels(reason="severity_floor").inc()
             return IngestResult(
                 dedupe_key=key,
                 status=RemediationStatus.FILTERED,
@@ -179,8 +201,11 @@ class RemediationPipeline:
         # point of DRY_RUN=true — inspect what we would do without touching
         # GitHub or Devin.
         if self.settings.dry_run:
-            self._record(finding, key, status=RemediationStatus.FILTERED)
+            self._record(
+                finding, key, status=RemediationStatus.FILTERED, request_id=request_id
+            )
             self.store.log_event(key, "dry_run_skip", {"reason": decision.reason})
+            metrics.findings_filtered.labels(reason="dry_run").inc()
             return IngestResult(
                 dedupe_key=key,
                 status=RemediationStatus.FILTERED,
@@ -192,7 +217,7 @@ class RemediationPipeline:
         issue = await self.gh.create_issue(
             finding.repo,
             title=finding.human_title(),
-            body=_issue_body(finding, key),
+            body=_issue_body(finding, key, request_id),
             labels=[
                 self.settings.issue_label,
                 f"severity:{finding.severity.value.lower()}",
@@ -204,6 +229,7 @@ class RemediationPipeline:
             status=RemediationStatus.DISPATCHED,
             issue_number=issue["number"],
             issue_url=issue["html_url"],
+            request_id=request_id,
         )
         self.store.log_event(key, "issue_created", {"url": issue["html_url"]})
 
@@ -212,6 +238,7 @@ class RemediationPipeline:
             key=key,
             issue=issue,
             decision_reason=decision.reason,
+            request_id=request_id,
             logger=logger,
         )
 
@@ -220,7 +247,17 @@ class RemediationPipeline:
     # ------------------------------------------------------------------ #
 
     async def reconcile_session(self, rec: RemediationRecord) -> None:
-        """Poll Devin to update session state; link PR if one appeared."""
+        """Poll Devin + GitHub to advance a record through the state machine.
+
+        Handles three distinct signals:
+          1. Session surfaced a PR we didn't know about → record PR_OPENED.
+          2. Session ended without a PR → record FAILED.
+          3. Session reports an acu_cost → persist it for cost dashboards.
+
+        A separate sub-step (:meth:`_reconcile_stale_pr`) handles records
+        that were already in PR_OPENED and have sat there longer than the
+        configured thresholds.
+        """
         if not rec.session_id or rec.status.is_terminal():
             return
         try:
@@ -230,6 +267,15 @@ class RemediationPipeline:
                 "reconcile_get_session_failed", err=str(e), session=rec.session_id
             )
             return
+
+        acu = self.devin.session_acu_cost(s)
+        if acu is not None and (rec.acu_cost is None or acu > rec.acu_cost):
+            # Devin's running total only goes up; always take the latest.
+            self.store.update_status(rec.dedupe_key, rec.status, acu_cost=acu)
+            self.store.log_event(rec.dedupe_key, "acu_cost_updated", {"acu": acu})
+            metrics.acu_cost_per_session.observe(acu)
+            rec.acu_cost = acu
+
         prs = s.get("pull_requests") or []
         if prs and not rec.pr_url:
             pr_url = prs[0].get("url") or prs[0].get("html_url") or str(prs[0])
@@ -244,10 +290,69 @@ class RemediationPipeline:
                     f":sparkles: Devin opened PR: {pr_url}",
                 )
             return
+
+        if rec.status == RemediationStatus.PR_OPENED and rec.pr_url:
+            await self._reconcile_stale_pr(rec)
+            return
+
         if not self.devin.session_is_active(s) and not prs and not rec.pr_url:
             self.store.update_status(rec.dedupe_key, RemediationStatus.FAILED)
             self.store.log_event(
                 rec.dedupe_key, "session_ended_no_pr", {"status": s.get("status")}
+            )
+
+    async def _reconcile_stale_pr(self, rec: RemediationRecord) -> None:
+        """Advance a long-open PR through the terminal states.
+
+        Three possible transitions based on GitHub's PR state:
+          * merged      → MERGED_UNVERIFIED (a human merged without a verify signal)
+          * closed      → HUMAN_REJECTED (closed without merge)
+          * still open  → NEEDS_ATTENTION if past ``stale_pr_flag_hours``
+
+        The WARN threshold is not a state change — it only surfaces the row
+        on the dashboard as "stale" so operators can triage before we
+        escalate to NEEDS_ATTENTION.
+        """
+        age_hours = (now_utc() - rec.updated_at).total_seconds() / 3600
+        try:
+            state = await self.gh.get_pr_state(rec.pr_url or "")
+        except httpx.HTTPError as e:
+            log.warning(
+                "reconcile_pr_state_failed",
+                err=str(e),
+                key=rec.dedupe_key,
+                pr=rec.pr_url,
+            )
+            return
+        if state is None:
+            return
+
+        if state.get("merged"):
+            self.store.update_status(
+                rec.dedupe_key,
+                RemediationStatus.MERGED_UNVERIFIED,
+                mark_resolved=True,
+            )
+            self.store.log_event(
+                rec.dedupe_key, "pr_merged_unverified", {"pr": rec.pr_url}
+            )
+            return
+        if state.get("state") == "closed":
+            self.store.update_status(
+                rec.dedupe_key,
+                RemediationStatus.HUMAN_REJECTED,
+                mark_resolved=True,
+            )
+            self.store.log_event(
+                rec.dedupe_key, "pr_closed_without_merge", {"pr": rec.pr_url}
+            )
+            return
+        if age_hours >= self.settings.stale_pr_flag_hours:
+            self.store.update_status(rec.dedupe_key, RemediationStatus.NEEDS_ATTENTION)
+            self.store.log_event(
+                rec.dedupe_key,
+                "pr_flagged_stale",
+                {"pr": rec.pr_url, "age_hours": round(age_hours, 1)},
             )
 
     # ------------------------------------------------------------------ #
@@ -264,6 +369,7 @@ class RemediationPipeline:
         issue_url: str | None = None,
         session_id: str | None = None,
         session_url: str | None = None,
+        request_id: str | None = None,
     ) -> RemediationRecord:
         """Create+persist a RemediationRecord with consistent timestamps.
 
@@ -279,6 +385,7 @@ class RemediationPipeline:
             issue_url=issue_url,
             session_id=session_id,
             session_url=session_url,
+            request_id=request_id,
             created_at=now,
             updated_at=now,
         )
@@ -361,6 +468,7 @@ class RemediationPipeline:
         key: str,
         issue: dict,
         decision_reason: str,
+        request_id: str,
         logger,
     ) -> IngestResult:
         prompt = build_prompt(
@@ -380,12 +488,14 @@ class RemediationPipeline:
                     f"rule:{finding.rule_id}",
                     f"severity:{finding.severity.value}",
                     f"repo:{finding.repo}",
+                    f"req:{request_id}",
                     "source:vuln-remediation-orchestrator",
                 ],
                 idempotent=True,
             )
         except httpx.HTTPError as e:
             logger.error("devin_dispatch_failed", err=str(e))
+            metrics.dispatch_failures.labels(scanner=finding.scanner).inc()
             self.store.update_status(key, RemediationStatus.FAILED)
             self.store.log_event(key, "devin_dispatch_failed", {"err": str(e)})
             await self.gh.comment_issue(
@@ -413,6 +523,9 @@ class RemediationPipeline:
             "devin_dispatched",
             {"session_id": session_id, "session_url": session_url},
         )
+        metrics.findings_dispatched.labels(
+            kind=finding.kind.value, severity=finding.severity.value
+        ).inc()
         await self.gh.comment_issue(
             finding.repo,
             issue["number"],
