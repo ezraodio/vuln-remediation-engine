@@ -26,7 +26,14 @@ jobs:
       - name: Lint
         run: ruff check app tests
       - name: Tests
-        run: pytest -q
+        run: pytest -q --cov --cov-report=term --cov-report=xml --cov-fail-under=90
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: orchestrator/coverage.xml
+          if-no-files-found: ignore
 
   docker:
     runs-on: ubuntu-latest
