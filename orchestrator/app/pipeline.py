@@ -122,7 +122,12 @@ class RemediationPipeline:
         # this, two simultaneous POSTs with the same dedupe_key both miss
         # the local-store read, both miss the GitHub-issue check, and both
         # dispatch Devin — wasting a session and spawning duplicate work.
+        #
+        # An explicit refcount (rather than poking ``lock._waiters``) drives
+        # eviction so the cleanup contract doesn't ride on a private asyncio
+        # internal that could be renamed across Python releases.
         self._key_locks: dict[str, asyncio.Lock] = {}
+        self._key_lock_refcount: dict[str, int] = {}
         self._key_locks_guard = asyncio.Lock()
 
     async def _lock_for(self, key: str) -> asyncio.Lock:
@@ -131,21 +136,23 @@ class RemediationPipeline:
             if lock is None:
                 lock = asyncio.Lock()
                 self._key_locks[key] = lock
+            self._key_lock_refcount[key] = self._key_lock_refcount.get(key, 0) + 1
             return lock
 
     async def _release_lock(self, key: str, lock: asyncio.Lock) -> None:
-        """Best-effort prune of a per-key lock after the critical section.
+        """Decrement the refcount for ``key`` and evict the lock at zero.
 
-        The lock map would otherwise grow with every unique dedupe_key for
-        the lifetime of the process. We evict only when no one is waiting
-        for this lock, so a concurrent caller mid-acquire can't be left with
-        a stale entry.
+        The refcount is incremented under the guard in ``_lock_for`` and
+        decremented here, also under the guard, so a concurrent caller
+        mid-acquire can never be left staring at a popped entry.
         """
         async with self._key_locks_guard:
-            if lock.locked() or getattr(lock, "_waiters", None):
+            remaining = self._key_lock_refcount.get(key, 0) - 1
+            if remaining > 0:
+                self._key_lock_refcount[key] = remaining
                 return
-            current = self._key_locks.get(key)
-            if current is lock:
+            self._key_lock_refcount.pop(key, None)
+            if self._key_locks.get(key) is lock:
                 self._key_locks.pop(key, None)
 
     # ------------------------------------------------------------------ #
@@ -354,36 +361,39 @@ class RemediationPipeline:
         escalate to NEEDS_ATTENTION.
         """
         age_hours = rec.pr_age_hours()
+        state: dict | None = None
         try:
             state = await self.gh.get_pr_state(rec.pr_url or "")
         except httpx.HTTPError as e:
             logger.warning("reconcile_pr_state_failed", err=str(e), pr=rec.pr_url)
-            return
-        if state is None:
-            return
 
-        if state.get("merged"):
-            self.store.update_status(
-                rec.dedupe_key,
-                RemediationStatus.MERGED_UNVERIFIED,
-                mark_resolved=True,
-            )
-            self.store.log_event(
-                rec.dedupe_key, "pr_merged_unverified", {"pr": rec.pr_url}
-            )
-            logger.info("pr_merged_unverified", pr=rec.pr_url)
-            return
-        if state.get("state") == "closed":
-            self.store.update_status(
-                rec.dedupe_key,
-                RemediationStatus.HUMAN_REJECTED,
-                mark_resolved=True,
-            )
-            self.store.log_event(
-                rec.dedupe_key, "pr_closed_without_merge", {"pr": rec.pr_url}
-            )
-            logger.info("pr_closed_without_merge", pr=rec.pr_url)
-            return
+        if state is not None:
+            if state.get("merged"):
+                self.store.update_status(
+                    rec.dedupe_key,
+                    RemediationStatus.MERGED_UNVERIFIED,
+                    mark_resolved=True,
+                )
+                self.store.log_event(
+                    rec.dedupe_key, "pr_merged_unverified", {"pr": rec.pr_url}
+                )
+                logger.info("pr_merged_unverified", pr=rec.pr_url)
+                return
+            if state.get("state") == "closed":
+                self.store.update_status(
+                    rec.dedupe_key,
+                    RemediationStatus.HUMAN_REJECTED,
+                    mark_resolved=True,
+                )
+                self.store.log_event(
+                    rec.dedupe_key, "pr_closed_without_merge", {"pr": rec.pr_url}
+                )
+                logger.info("pr_closed_without_merge", pr=rec.pr_url)
+                return
+
+        # Age-based NEEDS_ATTENTION must still fire when GitHub is
+        # unreachable or the PR was deleted — a silent-no-op would strand
+        # the record in PR_OPENED forever with zero operator signal.
         if (
             age_hours >= self.settings.stale_pr_flag_hours
             and rec.status != RemediationStatus.NEEDS_ATTENTION
@@ -543,11 +553,20 @@ class RemediationPipeline:
             metrics.dispatch_failures.labels(scanner=finding.scanner).inc()
             self.store.update_status(key, RemediationStatus.FAILED)
             self.store.log_event(key, "devin_dispatch_failed", {"err": str(e)})
-            await self.gh.comment_issue(
-                finding.repo,
-                issue["number"],
-                f":warning: Failed to dispatch Devin session: `{e}`",
-            )
+            # Best-effort notification on the tracking issue. If the GitHub
+            # API is also flapping we must not 500 the ingest endpoint —
+            # FAILED is already persisted, and the scanner would otherwise
+            # retry a dispatch we've already recorded as failed.
+            try:
+                await self.gh.comment_issue(
+                    finding.repo,
+                    issue["number"],
+                    f":warning: Failed to dispatch Devin session: `{e}`",
+                )
+            except httpx.HTTPError as comment_err:
+                logger.warning(
+                    "devin_dispatch_failed_comment_failed", err=str(comment_err)
+                )
             return IngestResult(
                 dedupe_key=key,
                 status=RemediationStatus.FAILED,

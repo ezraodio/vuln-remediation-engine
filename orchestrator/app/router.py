@@ -53,4 +53,6 @@ class Router:
                 reason="Dependency upgrade may require code changes",
             )
 
-        return RoutingDecision(action="dispatch_devin", reason="default")
+        # Fail loudly if a new FindingKind is added without a routing branch;
+        # silently dispatching would hide a misuse until prod.
+        raise NotImplementedError(f"unhandled FindingKind: {finding.kind!r}")

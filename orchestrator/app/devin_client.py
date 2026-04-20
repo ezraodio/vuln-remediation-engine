@@ -132,10 +132,17 @@ class DevinClient:
 
         Pages through results so busy orgs don't silently drop matches off the
         tail. `max_pages` bounds latency and is a sane cap for dedupe lookups.
+
+        Follows ``next_cursor`` only — never the request's own ``cursor``
+        field, which some paginated APIs echo back verbatim and would
+        otherwise drive us in a loop requesting the same page. Matches are
+        de-duplicated by session_id as a belt-and-suspenders guard against
+        pagination bugs upstream.
         """
         if self.mock:
             return []
         matches: list[dict] = []
+        seen: set[str] = set()
         cursor: str | None = None
         for _ in range(max_pages):
             path = f"/sessions?limit={page_size}"
@@ -146,10 +153,18 @@ class DevinClient:
                 break
             body = r.json()
             items = body.get("items", [])
-            matches.extend(s for s in items if tag in (s.get("tags") or []))
-            cursor = body.get("next_cursor") or body.get("cursor") or None
-            if not cursor or not items:
+            for s in items:
+                sid = s.get("session_id") or s.get("id")
+                if sid is not None:
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                if tag in (s.get("tags") or []):
+                    matches.append(s)
+            next_cursor = body.get("next_cursor")
+            if not next_cursor or not items:
                 break
+            cursor = next_cursor
         return matches
 
     async def send_message(self, session_id: str, message: str) -> None:
