@@ -208,7 +208,25 @@ class RemediationRecord(BaseModel):
     acu_cost: float | None = None
     created_at: datetime
     updated_at: datetime
+    pr_opened_at: datetime | None = None
     resolved_at: datetime | None = None
+
+    def pr_age_hours(self, now: datetime | None = None) -> float:
+        """Hours since the PR for this record was opened.
+
+        Anchored to ``pr_opened_at`` so the stale-PR clock is immune to
+        unrelated row mutations (e.g. ACU cost ratcheting during a
+        reconcile tick, which bumps ``updated_at``). Falls back to
+        ``updated_at`` only for legacy rows that predate the column so
+        stale detection keeps working on upgraded databases.
+
+        Returns 0.0 when there is no PR yet.
+        """
+        if not self.pr_url:
+            return 0.0
+        anchor = self.pr_opened_at or self.updated_at
+        ref = now or now_utc()
+        return (ref - anchor).total_seconds() / 3600
 
 
 class RulePerformance(BaseModel):

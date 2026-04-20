@@ -11,7 +11,7 @@ Only the endpoints we actually need:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 
@@ -19,6 +19,11 @@ from .logging_config import get_logger
 from .retry import with_retry
 
 log = get_logger("devin")
+
+_ACU_COST_FIELD_ALIASES = ("acu_cost", "total_acus", "acus_consumed", "acus")
+# Session statuses that legitimately have no ACU cost yet (pre-execution).
+# Anything else missing all four aliases likely indicates an API rename.
+_PRE_EXEC_STATUSES = frozenset({"", "starting", "queued", "pending"})
 
 
 class DevinClient:
@@ -179,15 +184,24 @@ class DevinClient:
             return False
         return status in {"running", "starting", "queued", "pending", "working"}
 
+    # Process-wide set of session_ids we've already logged a "no ACU field"
+    # warning for. Cost dashboards silently zeroing out is exactly the class
+    # of failure the alias list exists to guard against; if all aliases miss
+    # we want one (and only one) log line per session to surface the drift.
+    _warned_acu_missing: ClassVar[set[str]] = set()
+
     @staticmethod
     def session_acu_cost(session: dict) -> float | None:
         """Extract ACU spend from a session payload, tolerating field drift.
 
         The v3 API has surfaced the cost field under a handful of names across
         releases (acu_cost, total_acus, acus_consumed). Check each so a rename
-        upstream doesn't silently zero out our cost dashboard.
+        upstream doesn't silently zero out our cost dashboard. When all of
+        them are missing on an already-running session, emit a single warning
+        per session_id so we notice the drift rather than silently reporting
+        zero.
         """
-        for key in ("acu_cost", "total_acus", "acus_consumed", "acus"):
+        for key in _ACU_COST_FIELD_ALIASES:
             v = session.get(key)
             if v is None:
                 continue
@@ -195,4 +209,21 @@ class DevinClient:
                 return float(v)
             except (TypeError, ValueError):
                 continue
+        DevinClient._maybe_warn_acu_missing(session)
         return None
+
+    @staticmethod
+    def _maybe_warn_acu_missing(session: dict) -> None:
+        sid = session.get("session_id") or session.get("id")
+        if not sid or sid in DevinClient._warned_acu_missing:
+            return
+        status = (session.get("status") or "").lower()
+        if status in _PRE_EXEC_STATUSES:
+            return
+        log.warning(
+            "acu_cost_field_missing",
+            session_id=sid,
+            status=status,
+            known_fields=sorted(session.keys()),
+        )
+        DevinClient._warned_acu_missing.add(sid)

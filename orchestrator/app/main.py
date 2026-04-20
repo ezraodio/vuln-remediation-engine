@@ -31,7 +31,7 @@ from .devin_client import DevinClient
 from .github_client import GitHubClient
 from .logging_config import configure_logging, get_logger
 from .models import IngestRequest, IngestResponse, RemediationStatus, Severity
-from .observability import compute_stats
+from .observability import _is_needs_attention, compute_stats
 from .pipeline import RemediationPipeline
 from .router import Router
 from .time_utils import now_utc
@@ -264,6 +264,14 @@ async def events(limit: int = 100) -> dict:
 
 
 def _refresh_gauges(store: Store, settings: Settings) -> None:
+    """Refresh the point-in-time Prometheus gauges from the store.
+
+    ``needs_attention_gauge`` uses the same predicate as ``/stats`` and the
+    dashboard card so alertmanager thresholds line up with what an operator
+    sees in the UI. ``stale_prs_gauge`` is the open-PR slice of that — also
+    shown as the stale badge — and is exported separately so dashboards can
+    split "someone flagged this manually" from "PR aged out".
+    """
     active = 0
     needs_attn = 0
     stale = 0
@@ -275,12 +283,10 @@ def _refresh_gauges(store: Store, settings: Settings) -> None:
             RemediationStatus.SESSION_RUNNING,
         }:
             active += 1
-        if r.status == RemediationStatus.NEEDS_ATTENTION:
+        if _is_needs_attention(r, warn_hours, now):
             needs_attn += 1
-        if r.status == RemediationStatus.PR_OPENED:
-            age_hours = (now - r.updated_at).total_seconds() / 3600
-            if age_hours >= warn_hours:
-                stale += 1
+        if r.status == RemediationStatus.PR_OPENED and r.pr_age_hours(now) >= warn_hours:
+            stale += 1
     metrics.active_sessions.set(active)
     metrics.needs_attention_gauge.set(needs_attn)
     metrics.stale_prs_gauge.set(stale)
@@ -289,8 +295,7 @@ def _refresh_gauges(store: Store, settings: Settings) -> None:
 def _is_stale_pr(rec, settings: Settings) -> bool:
     if rec.status != RemediationStatus.PR_OPENED:
         return False
-    age_hours = (now_utc() - rec.updated_at).total_seconds() / 3600
-    return age_hours >= settings.stale_pr_warn_hours
+    return rec.pr_age_hours() >= settings.stale_pr_warn_hours
 
 
 # --------------------------------------------------------------------------- #

@@ -76,8 +76,22 @@ Target repo in this demo: [`ezraodio/superset`](https://github.com/ezraodio/supe
 - `GET /dashboard` — auto-refreshing HTML rendering of `/stats` plus a live
   table of every remediation with links out to the GitHub issue, Devin
   session, and PR.
+- `GET /metrics` — Prometheus exposition: counters (ingested, dispatched,
+  verified), histograms (verify latency), and point-in-time gauges
+  (active sessions, needs_attention, stale PRs).
 - `GET /events?limit=N` — structured audit log of every state transition.
-- All app logs are JSON with a `dedupe_key` correlation id.
+- All app logs are JSON with a `dedupe_key` + `request_id` correlation pair;
+  `request_id` is minted at `/ingest` (or accepted via `X-Request-Id`) and
+  flows into the Devin session tags and the tracking issue body.
+
+**Scaling limitations (read before wiring a scrape interval):** `/stats`,
+`/dashboard`, and `/metrics` each call `store.list_all()` — a full SQLite
+table scan — on every hit. That's deliberately simple for a single-process
+orchestrator in the low-thousands-of-records regime this system targets.
+At high record counts or an aggressive (sub-15s) Prometheus scrape interval,
+this will show up in CPU and request latency; the mitigation is either a
+cached gauge snapshot refreshed on ingest/reconcile, or moving the store to
+Postgres with indexed aggregation queries.
 
 ## Running it
 

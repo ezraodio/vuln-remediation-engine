@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS remediations (
     acu_cost REAL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    pr_opened_at TEXT,
     resolved_at TEXT
 );
 
@@ -49,6 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_events_key ON events(dedupe_key);
 _MIGRATIONS = (
     "ALTER TABLE remediations ADD COLUMN request_id TEXT",
     "ALTER TABLE remediations ADD COLUMN acu_cost REAL",
+    "ALTER TABLE remediations ADD COLUMN pr_opened_at TEXT",
 )
 
 
@@ -97,8 +99,8 @@ class Store:
                 INSERT INTO remediations (
                     dedupe_key, finding_json, status, issue_number, issue_url,
                     session_id, session_url, pr_url, request_id, acu_cost,
-                    created_at, updated_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, pr_opened_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dedupe_key) DO UPDATE SET
                     finding_json=excluded.finding_json,
                     status=excluded.status,
@@ -110,6 +112,7 @@ class Store:
                     request_id=COALESCE(excluded.request_id, remediations.request_id),
                     acu_cost=COALESCE(excluded.acu_cost, remediations.acu_cost),
                     updated_at=excluded.updated_at,
+                    pr_opened_at=COALESCE(excluded.pr_opened_at, remediations.pr_opened_at),
                     resolved_at=COALESCE(excluded.resolved_at, remediations.resolved_at)
                 """,
                 (
@@ -125,6 +128,7 @@ class Store:
                     record.acu_cost,
                     record.created_at.isoformat(),
                     record.updated_at.isoformat(),
+                    record.pr_opened_at.isoformat() if record.pr_opened_at else None,
                     record.resolved_at.isoformat() if record.resolved_at else None,
                 ),
             )
@@ -148,6 +152,7 @@ class Store:
         pr_url: str | None = None,
         request_id: str | None = None,
         acu_cost: float | None = None,
+        mark_pr_opened: bool = False,
         mark_resolved: bool = False,
     ) -> RemediationRecord | None:
         rec = self.get(dedupe_key)
@@ -170,6 +175,8 @@ class Store:
             rec.acu_cost = acu_cost
         now = now_utc()
         rec.updated_at = now
+        if mark_pr_opened and rec.pr_opened_at is None:
+            rec.pr_opened_at = now
         if mark_resolved:
             rec.resolved_at = now
         self.upsert(rec)
@@ -217,5 +224,10 @@ def _row_to_record(row: sqlite3.Row) -> RemediationRecord:
         acu_cost=row["acu_cost"] if "acu_cost" in keys else None,
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        pr_opened_at=(
+            datetime.fromisoformat(row["pr_opened_at"])
+            if "pr_opened_at" in keys and row["pr_opened_at"]
+            else None
+        ),
         resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
     )

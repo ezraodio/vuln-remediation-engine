@@ -169,12 +169,16 @@ class RemediationPipeline:
 
         # Open-issue dedupe covers the case where SQLite was dropped but the
         # GitHub issue still exists — prevents a duplicate from being filed.
-        if (issue_hit := await self._deduped_by_issue(finding, key)) is not None:
+        if (
+            issue_hit := await self._deduped_by_issue(finding, key, request_id=request_id)
+        ) is not None:
             logger.info("dedupe_hit_github_issue")
             metrics.findings_deduped.labels(layer="github_issue").inc()
             return issue_hit
 
-        if (session_hit := await self._deduped_by_session(finding, key)) is not None:
+        if (
+            session_hit := await self._deduped_by_session(finding, key, request_id=request_id)
+        ) is not None:
             logger.info("dedupe_hit_active_session")
             metrics.findings_deduped.labels(layer="active_session").inc()
             return session_hit
@@ -280,7 +284,10 @@ class RemediationPipeline:
         if prs and not rec.pr_url:
             pr_url = prs[0].get("url") or prs[0].get("html_url") or str(prs[0])
             self.store.update_status(
-                rec.dedupe_key, RemediationStatus.PR_OPENED, pr_url=pr_url
+                rec.dedupe_key,
+                RemediationStatus.PR_OPENED,
+                pr_url=pr_url,
+                mark_pr_opened=True,
             )
             self.store.log_event(rec.dedupe_key, "pr_opened", {"url": pr_url})
             if rec.issue_number:
@@ -313,7 +320,7 @@ class RemediationPipeline:
         on the dashboard as "stale" so operators can triage before we
         escalate to NEEDS_ATTENTION.
         """
-        age_hours = (now_utc() - rec.updated_at).total_seconds() / 3600
+        age_hours = rec.pr_age_hours()
         try:
             state = await self.gh.get_pr_state(rec.pr_url or "")
         except httpx.HTTPError as e:
@@ -410,7 +417,7 @@ class RemediationPipeline:
         )
 
     async def _deduped_by_issue(
-        self, finding: Finding, key: str
+        self, finding: Finding, key: str, *, request_id: str
     ) -> IngestResult | None:
         open_issue = await self.gh.find_open_issue_by_label(
             finding.repo, self.settings.issue_label, marker=f"`{key}`"
@@ -423,6 +430,7 @@ class RemediationPipeline:
             status=RemediationStatus.DEDUPED,
             issue_number=open_issue["number"],
             issue_url=open_issue["html_url"],
+            request_id=request_id,
         )
         self.store.log_event(
             key, "dedupe_hit_github_issue", {"issue": open_issue["html_url"]}
@@ -435,7 +443,7 @@ class RemediationPipeline:
         )
 
     async def _deduped_by_session(
-        self, finding: Finding, key: str
+        self, finding: Finding, key: str, *, request_id: str
     ) -> IngestResult | None:
         tag = f"vuln:{key}"
         candidates = await self.devin.list_sessions_by_tag(tag)
@@ -449,6 +457,7 @@ class RemediationPipeline:
             status=RemediationStatus.SESSION_RUNNING,
             session_id=s.get("session_id"),
             session_url=s.get("url"),
+            request_id=request_id,
         )
         self.store.log_event(
             key, "dedupe_hit_active_session", {"session": s.get("url")}

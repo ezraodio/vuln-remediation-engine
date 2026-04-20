@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
+from datetime import datetime
 
 from .config import Settings
 from .db import Store
@@ -45,10 +46,7 @@ def compute_stats(store: Store, settings: Settings | None = None) -> Stats:
             verified_fixed += 1
         if r.status == RemediationStatus.VERIFICATION_FAILED:
             verification_failed += 1
-        if r.status == RemediationStatus.NEEDS_ATTENTION:
-            needs_attention += 1
-        if r.status == RemediationStatus.PR_OPENED and _hours_since(r, now) >= warn_hours:
-            # PR has been open longer than warn threshold but not yet flagged.
+        if _is_needs_attention(r, warn_hours, now):
             needs_attention += 1
         if r.acu_cost is not None:
             total_acus += r.acu_cost
@@ -170,8 +168,21 @@ def _compute_by_rule(records: list[RemediationRecord]) -> list[RulePerformance]:
     return out
 
 
-def _hours_since(rec: RemediationRecord, now) -> float:
-    return (now - rec.updated_at).total_seconds() / 3600
+def _is_needs_attention(
+    rec: RemediationRecord, warn_hours: float, now: datetime
+) -> bool:
+    """Shared definition used by both /stats and the Prometheus gauge.
+
+    An operator should see the same number in the dashboard card and in
+    alertmanager — flagging one place and missing the other is worse than
+    flagging neither.
+    """
+    if rec.status == RemediationStatus.NEEDS_ATTENTION:
+        return True
+    return (
+        rec.status == RemediationStatus.PR_OPENED
+        and rec.pr_age_hours(now) >= warn_hours
+    )
 
 
 def _percentile(data: list[float], p: float) -> float:
