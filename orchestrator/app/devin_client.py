@@ -92,9 +92,6 @@ class DevinClient:
         title: str | None = None,
         tags: list[str] | None = None,
         idempotent: bool = True,
-        max_acu_limit: int | None = None,
-        create_as_user_id: str | None = None,
-        playbook_id: str | None = None,
     ) -> dict:
         """Create a new Devin session.
 
@@ -113,12 +110,6 @@ class DevinClient:
             body["title"] = title
         if tags:
             body["tags"] = tags[:50]
-        if max_acu_limit:
-            body["max_acu_limit"] = max_acu_limit
-        if create_as_user_id:
-            body["create_as_user_id"] = create_as_user_id
-        if playbook_id:
-            body["playbook_id"] = playbook_id
         # create_session with idempotent=True is safe to retry: Devin
         # deduplicates server-side on a hash of the prompt+tags+user.
         r = await self._request(

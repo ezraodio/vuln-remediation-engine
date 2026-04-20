@@ -31,7 +31,7 @@ from .devin_client import DevinClient
 from .github_client import GitHubClient
 from .logging_config import configure_logging, get_logger
 from .models import IngestRequest, IngestResponse, RemediationStatus, Severity
-from .observability import _is_needs_attention, compute_stats
+from .observability import _is_needs_attention, _is_stale_pr, compute_stats
 from .pipeline import RemediationPipeline
 from .router import Router
 from .time_utils import now_utc
@@ -239,7 +239,7 @@ async def dashboard() -> HTMLResponse:
         target_repo=settings.target_repo,
         format_duration=_format_duration,
         age=_age,
-        is_stale_pr=lambda r: _is_stale_pr(r, settings),
+        is_stale_pr=lambda r: _is_stale_pr(r, settings.stale_pr_warn_hours),
     )
     return HTMLResponse(html)
 
@@ -285,17 +285,11 @@ def _refresh_gauges(store: Store, settings: Settings) -> None:
             active += 1
         if _is_needs_attention(r, warn_hours, now):
             needs_attn += 1
-        if r.status == RemediationStatus.PR_OPENED and r.pr_age_hours(now) >= warn_hours:
+        if _is_stale_pr(r, warn_hours, now):
             stale += 1
     metrics.active_sessions.set(active)
     metrics.needs_attention_gauge.set(needs_attn)
     metrics.stale_prs_gauge.set(stale)
-
-
-def _is_stale_pr(rec, settings: Settings) -> bool:
-    if rec.status != RemediationStatus.PR_OPENED:
-        return False
-    return rec.pr_age_hours() >= settings.stale_pr_warn_hours
 
 
 # --------------------------------------------------------------------------- #

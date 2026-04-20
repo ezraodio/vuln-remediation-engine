@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from packaging.version import InvalidVersion, Version
-
 from .models import Finding, FindingKind, Severity
 
 
@@ -12,7 +10,6 @@ from .models import Finding, FindingKind, Severity
 class RoutingDecision:
     action: str          # "dispatch_devin" | "skip"
     reason: str
-    bump_target: str | None = None
 
 
 class Router:
@@ -54,20 +51,6 @@ class Router:
             return RoutingDecision(
                 action="dispatch_devin",
                 reason="Dependency upgrade may require code changes",
-                bump_target=_lowest_fixed_version(finding),
             )
 
         return RoutingDecision(action="dispatch_devin", reason="default")
-
-
-def _lowest_fixed_version(finding: Finding) -> str:
-    best: Version | None = None
-    best_raw: str | None = None
-    for v in finding.fixed_versions:
-        try:
-            parsed = Version(v)
-        except InvalidVersion:
-            continue
-        if best is None or parsed < best:
-            best, best_raw = parsed, v
-    return best_raw or (finding.fixed_versions[0] if finding.fixed_versions else "")

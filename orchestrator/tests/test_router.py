@@ -30,8 +30,7 @@ def test_no_fix_version_goes_to_devin_for_mitigation():
     assert "mitigation" in d.reason.lower() or "no patched" in d.reason.lower()
 
 
-def test_dep_cve_with_fix_dispatches_and_picks_lowest_fix():
+def test_dep_cve_with_fix_dispatches():
     r = Router(min_severity=Severity.HIGH, min_cvss=7.0)
     d = r.decide(make_dep_finding(installed="2.3.3", fixed=["2.4.0", "2.3.4"]))
     assert d.action == "dispatch_devin"
-    assert d.bump_target == "2.3.4"

@@ -100,31 +100,6 @@ async def test_still_vulnerable_messages_same_session(tmp_store):
 
 
 @pytest.mark.asyncio
-async def test_unknown_outcome_is_noop(tmp_store):
-    devin, gh = _RecordingDevin(), _RecordingGitHub()
-    v = Verifier(store=tmp_store, devin=devin, gh=gh)
-    key, _ = _seed_record(tmp_store)
-
-    before = tmp_store.get(key)
-    assert before is not None
-
-    await v.handle_report(
-        VerifyReport(
-            dedupe_key=key,
-            pr_url=None,
-            outcome=VerifyOutcome.UNKNOWN,
-        )
-    )
-
-    after = tmp_store.get(key)
-    assert after is not None
-    # Status unchanged; unknown never advances the state machine.
-    assert after.status == before.status
-    assert devin.messages == []
-    assert gh.comments == []
-
-
-@pytest.mark.asyncio
 async def test_report_for_unknown_key_is_noop(tmp_store):
     devin, gh = _RecordingDevin(), _RecordingGitHub()
     v = Verifier(store=tmp_store, devin=devin, gh=gh)

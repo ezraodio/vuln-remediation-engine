@@ -31,7 +31,6 @@ log = get_logger("verifier")
 class VerifyOutcome(StrEnum):
     CLEAN = "clean"                 # finding no longer reported
     STILL_VULNERABLE = "still_vuln" # finding still present on branch
-    UNKNOWN = "unknown"              # scanner error
 
 
 class VerifyReport(BaseModel):
@@ -130,6 +129,3 @@ class Verifier:
                         "verify_send_message_failed",
                         {"err": str(e), "session_id": rec.session_id},
                     )
-            return
-
-        logger.warning("verify_report_unknown_outcome")

@@ -168,6 +168,20 @@ def _compute_by_rule(records: list[RemediationRecord]) -> list[RulePerformance]:
     return out
 
 
+def _is_stale_pr(
+    rec: RemediationRecord, warn_hours: float, now: datetime | None = None
+) -> bool:
+    """A PR_OPENED record whose PR has aged past the warn threshold.
+
+    Shared by the dashboard "stale" badge and the ``vrm_stale_prs`` Prometheus
+    gauge so both surfaces agree on the same definition.
+    """
+    return (
+        rec.status == RemediationStatus.PR_OPENED
+        and rec.pr_age_hours(now) >= warn_hours
+    )
+
+
 def _is_needs_attention(
     rec: RemediationRecord, warn_hours: float, now: datetime
 ) -> bool:
@@ -179,10 +193,7 @@ def _is_needs_attention(
     """
     if rec.status == RemediationStatus.NEEDS_ATTENTION:
         return True
-    return (
-        rec.status == RemediationStatus.PR_OPENED
-        and rec.pr_age_hours(now) >= warn_hours
-    )
+    return _is_stale_pr(rec, warn_hours, now)
 
 
 def _percentile(data: list[float], p: float) -> float:

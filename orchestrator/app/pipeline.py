@@ -130,6 +130,21 @@ class RemediationPipeline:
                 self._key_locks[key] = lock
             return lock
 
+    async def _release_lock(self, key: str, lock: asyncio.Lock) -> None:
+        """Best-effort prune of a per-key lock after the critical section.
+
+        The lock map would otherwise grow with every unique dedupe_key for
+        the lifetime of the process. We evict only when no one is waiting
+        for this lock, so a concurrent caller mid-acquire can't be left with
+        a stale entry.
+        """
+        async with self._key_locks_guard:
+            if lock.locked() or getattr(lock, "_waiters", None):
+                return
+            current = self._key_locks.get(key)
+            if current is lock:
+                self._key_locks.pop(key, None)
+
     # ------------------------------------------------------------------ #
     # Public entrypoint                                                  #
     # ------------------------------------------------------------------ #
@@ -143,10 +158,13 @@ class RemediationPipeline:
         rid = request_id or uuid.uuid4().hex
         key = finding.dedupe_key()
         lock = await self._lock_for(key)
-        async with lock:
-            return await self._handle_finding_locked(
-                finding, key=key, source=source, request_id=rid
-            )
+        try:
+            async with lock:
+                return await self._handle_finding_locked(
+                    finding, key=key, source=source, request_id=rid
+                )
+        finally:
+            await self._release_lock(key, lock)
 
     async def _handle_finding_locked(
         self, finding: Finding, *, key: str, source: str, request_id: str
@@ -264,12 +282,16 @@ class RemediationPipeline:
         """
         if not rec.session_id or rec.status.is_terminal():
             return
+        logger = log.bind(
+            dedupe_key=rec.dedupe_key,
+            rule=rec.finding.rule_id,
+            request_id=rec.request_id,
+            session=rec.session_id,
+        )
         try:
             s = await self.devin.get_session(rec.session_id)
         except httpx.HTTPError as e:
-            log.warning(
-                "reconcile_get_session_failed", err=str(e), session=rec.session_id
-            )
+            logger.warning("reconcile_get_session_failed", err=str(e))
             return
 
         acu = self.devin.session_acu_cost(s)
@@ -299,7 +321,7 @@ class RemediationPipeline:
             return
 
         if rec.status == RemediationStatus.PR_OPENED and rec.pr_url:
-            await self._reconcile_stale_pr(rec)
+            await self._reconcile_stale_pr(rec, logger)
             return
 
         if not self.devin.session_is_active(s) and not prs and not rec.pr_url:
@@ -307,8 +329,9 @@ class RemediationPipeline:
             self.store.log_event(
                 rec.dedupe_key, "session_ended_no_pr", {"status": s.get("status")}
             )
+            logger.info("session_ended_no_pr", status=s.get("status"))
 
-    async def _reconcile_stale_pr(self, rec: RemediationRecord) -> None:
+    async def _reconcile_stale_pr(self, rec: RemediationRecord, logger) -> None:
         """Advance a long-open PR through the terminal states.
 
         Three possible transitions based on GitHub's PR state:
@@ -324,12 +347,7 @@ class RemediationPipeline:
         try:
             state = await self.gh.get_pr_state(rec.pr_url or "")
         except httpx.HTTPError as e:
-            log.warning(
-                "reconcile_pr_state_failed",
-                err=str(e),
-                key=rec.dedupe_key,
-                pr=rec.pr_url,
-            )
+            logger.warning("reconcile_pr_state_failed", err=str(e), pr=rec.pr_url)
             return
         if state is None:
             return
@@ -343,6 +361,7 @@ class RemediationPipeline:
             self.store.log_event(
                 rec.dedupe_key, "pr_merged_unverified", {"pr": rec.pr_url}
             )
+            logger.info("pr_merged_unverified", pr=rec.pr_url)
             return
         if state.get("state") == "closed":
             self.store.update_status(
@@ -353,6 +372,7 @@ class RemediationPipeline:
             self.store.log_event(
                 rec.dedupe_key, "pr_closed_without_merge", {"pr": rec.pr_url}
             )
+            logger.info("pr_closed_without_merge", pr=rec.pr_url)
             return
         if age_hours >= self.settings.stale_pr_flag_hours:
             self.store.update_status(rec.dedupe_key, RemediationStatus.NEEDS_ATTENTION)
@@ -360,6 +380,9 @@ class RemediationPipeline:
                 rec.dedupe_key,
                 "pr_flagged_stale",
                 {"pr": rec.pr_url, "age_hours": round(age_hours, 1)},
+            )
+            logger.warning(
+                "pr_flagged_stale", pr=rec.pr_url, age_hours=round(age_hours, 1)
             )
 
     # ------------------------------------------------------------------ #

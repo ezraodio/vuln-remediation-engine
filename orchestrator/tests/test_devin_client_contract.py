@@ -38,7 +38,6 @@ async def test_create_session_sends_expected_shape(devin):
         title="auto-remediation",
         tags=["vuln:abc", "rule:B324"],
         idempotent=True,
-        max_acu_limit=50,
     )
     assert out["session_id"] == "sess-1"
     assert route.called
@@ -50,7 +49,6 @@ async def test_create_session_sends_expected_shape(devin):
     assert body["title"] == "auto-remediation"
     assert body["tags"] == ["vuln:abc", "rule:B324"]
     assert body["idempotent"] is True
-    assert body["max_acu_limit"] == 50
 
 
 @respx.mock

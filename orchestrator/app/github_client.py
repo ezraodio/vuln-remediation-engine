@@ -146,16 +146,22 @@ class GitHubClient:
                 "html_url": f"https://github.com/{repo}/issues/mock",
                 "mock": True,
             }
+        applied_labels = labels or ["devin-remediation"]
+        # Ensure the caller's primary (orchestrator) label exists with a
+        # description/colour so operators filtering the Issues tab get useful
+        # metadata. GitHub will auto-create any label that doesn't exist when
+        # the issue is filed, but those auto-created labels have no colour or
+        # description — worth the one extra request to make the label useful.
         await self.ensure_label(
             repo,
-            "devin-remediation",
+            applied_labels[0],
             color="b60205",
             description="Tracked by the vulnerability remediation orchestrator",
         )
         r = await self._req(
             "POST",
             f"/repos/{repo}/issues",
-            json={"title": title, "body": body, "labels": labels or ["devin-remediation"]},
+            json={"title": title, "body": body, "labels": applied_labels},
         )
         r.raise_for_status()
         return r.json()
@@ -169,35 +175,7 @@ class GitHubClient:
         )
         r.raise_for_status()
 
-    async def close_issue(self, repo: str, number: int) -> None:
-        if self.mock:
-            return
-        await self._req(
-            "PATCH",
-            f"/repos/{repo}/issues/{number}",
-            json={"state": "closed"},
-            retry=True,
-        )
-
     # ---------- pulls ----------
-
-    async def find_pr_linked_to_issue(self, repo: str, issue_number: int) -> dict | None:
-        """Look for an open PR whose title or body references #issue_number."""
-        if self.mock:
-            return None
-        r = await self._req(
-            "GET",
-            f"/repos/{repo}/pulls",
-            params={"state": "open", "per_page": 100},
-            retry=True,
-        )
-        if r.status_code != 200:
-            return None
-        needle = f"#{issue_number}"
-        for pr in r.json():
-            if needle in (pr.get("title") or "") or needle in (pr.get("body") or ""):
-                return pr
-        return None
 
     async def get_pr_state(self, pr_url: str) -> dict | None:
         """Fetch a PR's state given its html_url.

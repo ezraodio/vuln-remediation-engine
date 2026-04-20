@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     devin_api_base: str = Field("https://api.devin.ai", alias="DEVIN_API_BASE")
     devin_api_key: str = Field("", alias="DEVIN_API_KEY")
     devin_org_id: str = Field("", alias="DEVIN_ORG_ID")
-    devin_create_as_user_id: str | None = Field(None, alias="DEVIN_CREATE_AS_USER_ID")
 
     # --- GitHub ---
     github_api_base: str = Field("https://api.github.com", alias="GITHUB_API_BASE")
