@@ -37,7 +37,7 @@ class GitHubClient:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    async def _req(
+    async def _request(
         self, method: str, path: str, *, retry: bool = False, **kw: Any
     ) -> httpx.Response:
         """Issue a GitHub request; opt-in retry for idempotent calls only.
@@ -72,10 +72,10 @@ class GitHubClient:
     async def ensure_label(self, repo: str, name: str, color: str = "b60205", description: str = "") -> None:
         if self.mock:
             return
-        r = await self._req("GET", f"/repos/{repo}/labels/{name}", retry=True)
+        r = await self._request("GET", f"/repos/{repo}/labels/{name}", retry=True)
         if r.status_code == 200:
             return
-        await self._req(
+        await self._request(
             "POST",
             f"/repos/{repo}/labels",
             json={"name": name, "color": color, "description": description},
@@ -104,7 +104,7 @@ class GitHubClient:
         if self.mock:
             return None
         for page in range(1, max_pages + 1):
-            r = await self._req(
+            r = await self._request(
                 "GET",
                 f"/repos/{repo}/issues",
                 params={
@@ -158,7 +158,7 @@ class GitHubClient:
             color="b60205",
             description="Tracked by the vulnerability remediation orchestrator",
         )
-        r = await self._req(
+        r = await self._request(
             "POST",
             f"/repos/{repo}/issues",
             json={"title": title, "body": body, "labels": applied_labels},
@@ -170,7 +170,7 @@ class GitHubClient:
         if self.mock:
             log.info("mock_issue_comment", repo=repo, number=number, body=body[:200])
             return
-        r = await self._req(
+        r = await self._request(
             "POST", f"/repos/{repo}/issues/{number}/comments", json={"body": body}
         )
         r.raise_for_status()
@@ -191,7 +191,7 @@ class GitHubClient:
         if not m:
             return None
         owner, repo, number = m.group("owner"), m.group("repo"), m.group("number")
-        r = await self._req(
+        r = await self._request(
             "GET", f"/repos/{owner}/{repo}/pulls/{number}", retry=True
         )
         if r.status_code != 200:

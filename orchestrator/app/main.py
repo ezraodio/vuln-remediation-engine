@@ -31,7 +31,7 @@ from .devin_client import DevinClient
 from .github_client import GitHubClient
 from .logging_config import configure_logging, get_logger
 from .models import IngestRequest, IngestResponse, RemediationStatus, Severity
-from .observability import _is_needs_attention, _is_stale_pr, compute_stats
+from .observability import compute_stats, is_needs_attention, is_stale_pr
 from .pipeline import RemediationPipeline
 from .router import Router
 from .time_utils import now_utc
@@ -162,6 +162,9 @@ async def ingest(
         "ingest_received", request_id=request_id, source=req.source, count=len(req.findings)
     )
 
+    # Broad catch is intentional: a single malformed or exceptional finding
+    # must not drop sibling findings in the same batch. Each failure is
+    # logged with full context so it remains debuggable.
     results = []
     for f in req.findings:
         try:
@@ -205,14 +208,10 @@ async def reconcile(
     _authz(settings, x_ingest_secret)
     pipeline: RemediationPipeline = app.state.pipeline
     store: Store = app.state.store
-    # Terminal rows (FAILED/FILTERED/DEDUPED/VERIFIED_FIXED/VERIFICATION_FAILED)
-    # have nothing left to reconcile. `resolved_at` alone is not a terminal
-    # signal — only VERIFIED_FIXED sets it, so records like FAILED would
-    # otherwise ping the Devin API on every cron tick for no reason.
     reconciled = 0
     skipped = 0
     for rec in store.list_all():
-        if not rec.session_id or rec.status.is_terminal():
+        if not pipeline.should_reconcile(rec):
             skipped += 1
             continue
         await pipeline.reconcile_session(rec)
@@ -239,7 +238,7 @@ async def dashboard() -> HTMLResponse:
         target_repo=settings.target_repo,
         format_duration=_format_duration,
         age=_age,
-        is_stale_pr=lambda r: _is_stale_pr(r, settings.stale_pr_warn_hours),
+        is_stale_pr=lambda r: is_stale_pr(r, settings.stale_pr_warn_hours),
     )
     return HTMLResponse(html)
 
@@ -283,9 +282,9 @@ def _refresh_gauges(store: Store, settings: Settings) -> None:
             RemediationStatus.SESSION_RUNNING,
         }:
             active += 1
-        if _is_needs_attention(r, warn_hours, now):
+        if is_needs_attention(r, warn_hours, now):
             needs_attn += 1
-        if _is_stale_pr(r, warn_hours, now):
+        if is_stale_pr(r, warn_hours, now):
             stale += 1
     metrics.active_sessions.set(active)
     metrics.needs_attention_gauge.set(needs_attn)

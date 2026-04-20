@@ -27,6 +27,12 @@ _PRE_EXEC_STATUSES = frozenset({"", "starting", "queued", "pending"})
 
 
 class DevinClient:
+    # Process-wide set of session_ids for which we have already logged a
+    # missing-ACU-field warning. Silent zeroing of the cost dashboard is
+    # exactly what the alias list guards against, so when all aliases miss
+    # we want one warning per session (not one per reconcile tick).
+    _warned_acu_missing: ClassVar[set[str]] = set()
+
     def __init__(
         self,
         api_key: str,
@@ -189,12 +195,6 @@ class DevinClient:
         if session.get("is_archived"):
             return False
         return status in {"running", "starting", "queued", "pending", "working"}
-
-    # Process-wide set of session_ids we've already logged a "no ACU field"
-    # warning for. Cost dashboards silently zeroing out is exactly the class
-    # of failure the alias list exists to guard against; if all aliases miss
-    # we want one (and only one) log line per session to surface the drift.
-    _warned_acu_missing: ClassVar[set[str]] = set()
 
     @staticmethod
     def session_acu_cost(session: dict) -> float | None:
