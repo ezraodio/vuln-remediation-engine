@@ -62,7 +62,10 @@ def _issue_body(finding: Finding, dedupe_key: str, request_id: str) -> str:
     if finding.description:
         lines += ["", "## Description", finding.description]
     if finding.code_excerpt:
-        lines += ["", "## Code", "```", finding.code_excerpt, "```"]
+        # Tilde fence: immune to backtick runs inside the excerpt. A raw
+        # triple-backtick fence would close early if the scanner-supplied
+        # excerpt itself contains ``` (common in docstrings / READMEs).
+        lines += ["", "## Code", "~~~", finding.code_excerpt, "~~~"]
     lines += [
         "",
         "## Remediation status",
@@ -320,7 +323,14 @@ class RemediationPipeline:
                 )
             return
 
-        if rec.status == RemediationStatus.PR_OPENED and rec.pr_url:
+        # NEEDS_ATTENTION is reached only by aging past the flag threshold,
+        # so we must keep polling that PR — a human might still merge or close
+        # it. Without this, once flagged, the record is invisible to the
+        # reconciler forever even though the PR could legitimately resolve.
+        if rec.status in {
+            RemediationStatus.PR_OPENED,
+            RemediationStatus.NEEDS_ATTENTION,
+        } and rec.pr_url:
             await self._reconcile_stale_pr(rec, logger)
             return
 
@@ -374,7 +384,10 @@ class RemediationPipeline:
             )
             logger.info("pr_closed_without_merge", pr=rec.pr_url)
             return
-        if age_hours >= self.settings.stale_pr_flag_hours:
+        if (
+            age_hours >= self.settings.stale_pr_flag_hours
+            and rec.status != RemediationStatus.NEEDS_ATTENTION
+        ):
             self.store.update_status(rec.dedupe_key, RemediationStatus.NEEDS_ATTENTION)
             self.store.log_event(
                 rec.dedupe_key,

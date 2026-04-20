@@ -129,6 +129,15 @@ jobs:
           want_file = (os.environ.get("FILE_PATH") or "").strip()
           want_pkg = (os.environ.get("PACKAGE_NAME") or "").strip().lower()
 
+          # Bail if critical metadata is missing. Without rule+kind we can't
+          # filter scanner output to *this* finding; posting "clean" anyway
+          # would silently mark the record VERIFIED_FIXED, turning a metadata
+          # bug into a false all-clear. Skip the POST so the orchestrator's
+          # stale-PR reconciler stays authoritative.
+          if not rule or kind not in ("sast", "dep_cve"):
+              print(f"Missing/unknown metadata (rule={rule!r}, kind={kind!r}); skipping POST")
+              raise SystemExit(0)
+
           outcome = "clean"
           details = []
 

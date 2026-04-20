@@ -94,6 +94,43 @@ async def test_open_past_flag_threshold_transitions_to_needs_attention(
     assert tmp_store.get(rec.dedupe_key).status == RemediationStatus.NEEDS_ATTENTION
 
 
+async def test_needs_attention_pr_still_advances_on_merge(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    """A record already flagged NEEDS_ATTENTION must still be re-polled.
+
+    Regression: before, ``reconcile_session`` only invoked the stale-PR
+    reconciler for status == PR_OPENED, so a PR that aged into
+    NEEDS_ATTENTION and then got merged by a human would stay flagged forever.
+    """
+    f = make_sast_finding()
+    now = now_utc()
+    past = now - timedelta(hours=72)
+    rec = RemediationRecord(
+        dedupe_key=f.dedupe_key(),
+        finding=f,
+        status=RemediationStatus.NEEDS_ATTENTION,
+        session_id="sess-1",
+        issue_number=1,
+        pr_url="https://github.com/o/r/pull/7",
+        created_at=past,
+        updated_at=past,
+        pr_opened_at=past,
+    )
+    tmp_store.upsert(rec)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "closed", "merged": True}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    out = tmp_store.get(rec.dedupe_key)
+    assert out.status == RemediationStatus.MERGED_UNVERIFIED
+    assert out.resolved_at is not None
+
+
 async def test_fresh_open_pr_stays_in_pr_opened(
     tmp_store, fake_devin, fake_gh, monkeypatch
 ):

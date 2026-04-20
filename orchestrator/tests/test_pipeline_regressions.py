@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import asyncio
 
-from app.models import RemediationStatus, Severity
-from app.pipeline import RemediationPipeline
+from app.models import FindingKind, RemediationStatus, Severity
+from app.pipeline import RemediationPipeline, _issue_body
 from app.router import Router
 
 from .conftest import FakeSettings, make_dep_finding, make_sast_finding
@@ -80,6 +80,25 @@ async def test_concurrent_ingest_of_same_key_dispatches_exactly_once(
     statuses = sorted([r1.status.value, r2.status.value])
     assert statuses == ["deduped", "dispatched"]
     assert len(dispatches) == 1
+
+
+def test_issue_body_code_fence_is_robust_to_backticks_in_excerpt():
+    """Code excerpts containing ``` must not break out of the issue's fence.
+
+    Regression: a previous implementation used a triple-backtick fence, which
+    terminated early whenever the scanner-supplied excerpt itself contained
+    triple backticks (common in docstrings). The resulting issue body
+    corrupted GitHub's markdown rendering and, more importantly, leaked the
+    excerpt's trailing text out of the code block.
+    """
+    f = make_sast_finding()
+    assert f.kind == FindingKind.SAST
+    f.code_excerpt = "def f():\n    '''\n    ```python\n    evil\n    ```\n    '''"
+    body = _issue_body(f, "k", "rid")
+    assert "~~~" in body
+    # The sentinel after the fence must appear after the excerpt, not before
+    # (i.e. the fence must not have closed mid-excerpt).
+    assert body.index("## Code") < body.index("## Remediation status")
 
 
 async def test_handle_finding_is_reentrant_after_lock_release(
