@@ -108,3 +108,44 @@ async def test_comment_issue_raises_on_4xx(gh):
     )
     with pytest.raises(httpx.HTTPError):
         await gh.comment_issue("o/r", 1, "hello")
+
+
+@respx.mock
+async def test_ensure_label_creates_when_missing(gh):
+    respx.get("https://api.github.com/repos/o/r/labels/custom").mock(
+        return_value=httpx.Response(404, json={"message": "not found"})
+    )
+    create = respx.post("https://api.github.com/repos/o/r/labels").mock(
+        return_value=httpx.Response(201, json={"name": "custom"})
+    )
+    await gh.ensure_label("o/r", "custom", color="ff0000", description="x")
+    assert create.called
+    import json as _json
+
+    body = _json.loads(create.calls.last.request.content)
+    assert body == {"name": "custom", "color": "ff0000", "description": "x"}
+
+
+@respx.mock
+async def test_get_pr_state_parses_merged_and_closed(gh):
+    respx.get(
+        "https://api.github.com/repos/o/r/pulls/7"
+    ).mock(return_value=httpx.Response(200, json={"state": "closed", "merged": True}))
+    got = await gh.get_pr_state("https://github.com/o/r/pull/7")
+    assert got == {"state": "closed", "merged": True}
+
+
+@respx.mock
+async def test_get_pr_state_returns_none_on_404(gh):
+    respx.get(
+        "https://api.github.com/repos/o/r/pulls/99"
+    ).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+    assert await gh.get_pr_state("https://github.com/o/r/pull/99") is None
+
+
+async def test_get_pr_state_returns_none_on_unparseable_url(gh):
+    # Stale-PR reconciler must not crash on a malformed html_url cached in
+    # the DB from a prior schema; unparseable PR URLs surface as None so
+    # the age-based flag path can still fire.
+    assert await gh.get_pr_state("not-a-url") is None
+    assert await gh.get_pr_state("") is None

@@ -113,6 +113,33 @@ async def test_create_session_raises_on_4xx(devin):
         await devin.create_session(prompt="p")
 
 
+def test_session_acu_cost_tolerates_bad_types_and_warns_once():
+    d = DevinClient(api_key="x", org_id="y", mock=True)
+
+    # Field present but non-numeric: tolerate, keep scanning aliases, and
+    # ultimately report None rather than crashing the reconcile tick.
+    DevinClient._warned_acu_missing.clear()
+    assert d.session_acu_cost({"acu_cost": "not-a-number"}) is None
+
+    # Pre-execution statuses must NOT trigger the warning (session simply
+    # hasn't started billing yet).
+    DevinClient._warned_acu_missing.clear()
+    assert d.session_acu_cost({"session_id": "s-pre", "status": "queued"}) is None
+    assert "s-pre" not in DevinClient._warned_acu_missing
+
+    # Running session with no recognised alias: record the session_id so
+    # subsequent reconcile ticks stay silent. The first call warns; the
+    # second is a no-op.
+    DevinClient._warned_acu_missing.clear()
+    running = {"session_id": "s-run", "status": "running"}
+    assert d.session_acu_cost(running) is None
+    assert d.session_acu_cost(running) is None
+    assert "s-run" in DevinClient._warned_acu_missing
+
+    # Well-formed numeric alias is returned as float.
+    assert d.session_acu_cost({"total_acus": 12}) == 12.0
+
+
 def test_session_is_active_respects_status():
     d = DevinClient(api_key="x", org_id="y", mock=True)
     for s in ("running", "starting", "queued", "pending", "working"):
