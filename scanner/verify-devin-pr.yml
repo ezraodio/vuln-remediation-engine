@@ -47,7 +47,15 @@ jobs:
           python - <<'PY'
           import json, os, re, sys, urllib.request
 
-          pr_body = json.loads(os.environ.get("PR_JSON") or "{}").get("body") or ""
+          # On workflow_dispatch there is no PR context, so
+          # ${{ toJson(github.event.pull_request) }} renders the literal
+          # string "null" — not empty, so the `or "{}"` guard doesn't kick
+          # in — and json.loads returns Python None. Guard against that
+          # plus any other non-object JSON payload (e.g. a bare string or
+          # array from a future GitHub change) so the manual-trigger path
+          # doesn't AttributeError before we can read FALLBACK_KEY.
+          _pr = json.loads(os.environ.get("PR_JSON") or "{}")
+          pr_body = (_pr.get("body") if isinstance(_pr, dict) else None) or ""
           # Prefer an explicit GitHub "closing keyword" reference (Closes/Fixes/
           # Resolves #N) over a bare #N mention, since Devin's PR body may
           # reference unrelated issues in discussion before the closing line.
