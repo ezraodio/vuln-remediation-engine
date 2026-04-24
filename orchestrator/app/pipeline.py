@@ -327,6 +327,31 @@ class RemediationPipeline:
         if not self.devin.session_is_active(session) and not prs and not rec.pr_url:
             self._record_session_failed(rec, session, logger)
 
+    async def _best_effort_comment(
+        self,
+        dedupe_key: str,
+        repo: str,
+        issue_number: int,
+        body: str,
+        *,
+        event: str,
+    ) -> None:
+        """Post a tracking-issue comment without letting GitHub flaps leak out.
+
+        The calling site has already persisted a state transition (FAILED,
+        SESSION_RUNNING, PR_OPENED, …); the comment is operator-visibility
+        sugar. If GitHub is down we log the failure through the store audit
+        log and the structured logger so operators can still trace what
+        happened, but we never propagate the error to the HTTP handler — that
+        would 500 a request whose actual work has already succeeded and
+        prompt the scanner/CI to retry work we've already recorded.
+        """
+        try:
+            await self.gh.comment_issue(repo, issue_number, body)
+        except httpx.HTTPError as err:
+            log.warning(event, err=str(err), dedupe_key=dedupe_key)
+            self.store.log_event(dedupe_key, event, {"err": str(err)})
+
     def _persist_acu_cost(self, rec: RemediationRecord, session: dict) -> None:
         """Write Devin's current ACU total to the record if it has grown.
 
@@ -350,10 +375,12 @@ class RemediationPipeline:
         )
         self.store.log_event(rec.dedupe_key, "pr_opened", {"url": pr_url})
         if rec.issue_number:
-            await self.gh.comment_issue(
+            await self._best_effort_comment(
+                rec.dedupe_key,
                 rec.finding.repo,
                 rec.issue_number,
                 f":sparkles: Devin opened PR: {pr_url}",
+                event="pr_opened_comment_failed",
             )
 
     def _record_session_failed(
@@ -581,19 +608,13 @@ class RemediationPipeline:
         metrics.dispatch_failures.labels(scanner=finding.scanner).inc()
         self.store.update_status(key, RemediationStatus.FAILED)
         self.store.log_event(key, "devin_dispatch_failed", {"err": str(error)})
-        # Notification is best-effort: FAILED is already persisted, so a GitHub
-        # flap here must not 500 /ingest and cause the scanner to retry a
-        # dispatch we've already recorded as failed.
-        try:
-            await self.gh.comment_issue(
-                finding.repo,
-                issue["number"],
-                f":warning: Failed to dispatch Devin session: `{error}`",
-            )
-        except httpx.HTTPError as comment_err:
-            logger.warning(
-                "devin_dispatch_failed_comment_failed", err=str(comment_err)
-            )
+        await self._best_effort_comment(
+            key,
+            finding.repo,
+            issue["number"],
+            f":warning: Failed to dispatch Devin session: `{error}`",
+            event="devin_dispatch_failed_comment_failed",
+        )
         return IngestResult(
             dedupe_key=key,
             status=RemediationStatus.FAILED,
@@ -626,11 +647,13 @@ class RemediationPipeline:
         metrics.findings_dispatched.labels(
             kind=finding.kind.value, severity=finding.severity.value
         ).inc()
-        await self.gh.comment_issue(
+        await self._best_effort_comment(
+            key,
             finding.repo,
             issue["number"],
             f":robot: Devin session started: {session_url}\n\n"
             f"Routing reason: _{decision_reason}_",
+            event="devin_dispatched_comment_failed",
         )
         return IngestResult(
             dedupe_key=key,

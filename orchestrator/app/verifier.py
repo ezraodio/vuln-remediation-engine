@@ -46,6 +46,31 @@ class Verifier:
         self.devin = devin
         self.gh = gh
 
+    async def _best_effort_comment(
+        self,
+        dedupe_key: str,
+        repo: str,
+        issue_number: int,
+        body: str,
+        *,
+        event: str,
+        logger,
+    ) -> None:
+        """Post an operator-visibility comment; log on failure but never raise.
+
+        The verification status transition has already been persisted before
+        we get here. Propagating a transient GitHub error back to
+        /verify/result would 500 the scanner's CI POST, which would then
+        retry — and without the terminal-status guard above, the retry would
+        double-count metrics. Logging + an audit-log event keeps the failure
+        debuggable without destabilising the endpoint contract.
+        """
+        try:
+            await self.gh.comment_issue(repo, issue_number, body)
+        except httpx.HTTPError as err:
+            logger.warning(event, err=str(err))
+            self.store.log_event(dedupe_key, event, {"err": str(err)})
+
     async def handle_report(self, report: VerifyReport) -> None:
         rec = self.store.get(report.dedupe_key)
         if not rec:
@@ -58,6 +83,16 @@ class Verifier:
             outcome=report.outcome.value,
             pr=report.pr_url,
         )
+
+        # CI workflows retry on transient 5xx, so /verify/result can be
+        # delivered more than once for the same dedupe_key. Once we've
+        # landed on a terminal status (VERIFIED_FIXED / HUMAN_REJECTED /
+        # FAILED), replaying the body would double-count verify_outcomes,
+        # re-observe MTTR, and emit a duplicate verify_report event.
+        if rec.status.is_terminal():
+            logger.info("verify_report_ignored_terminal", status=rec.status.value)
+            return
+
         logger.info("verify_report_received")
         self.store.log_event(
             report.dedupe_key,
@@ -77,11 +112,14 @@ class Verifier:
             )
             metrics.mttr_seconds.observe(latency)
             if rec.issue_number:
-                await self.gh.comment_issue(
+                await self._best_effort_comment(
+                    report.dedupe_key,
                     rec.finding.repo,
                     rec.issue_number,
                     f":white_check_mark: Verified fix on {report.pr_url}: "
                     f"`{rec.finding.rule_id}` no longer reported by the scanner.",
+                    event="verify_fixed_comment_failed",
+                    logger=logger,
                 )
             return
 
@@ -92,12 +130,15 @@ class Verifier:
                 pr_url=report.pr_url,
             )
             if rec.issue_number:
-                await self.gh.comment_issue(
+                await self._best_effort_comment(
+                    report.dedupe_key,
                     rec.finding.repo,
                     rec.issue_number,
                     f":x: Verification failed on {report.pr_url}: "
                     f"`{rec.finding.rule_id}` is still reported on your branch. "
                     f"Messaging the session to iterate.",
+                    event="verify_failed_comment_failed",
+                    logger=logger,
                 )
             # Feed the failure back into the running session instead of
             # starting a new one. Devin will see the message and iterate.

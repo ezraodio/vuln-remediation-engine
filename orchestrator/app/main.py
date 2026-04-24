@@ -210,13 +210,28 @@ async def reconcile(
     store: Store = app.state.store
     reconciled = 0
     skipped = 0
+    errored = 0
     for rec in store.list_all():
         if not pipeline.should_reconcile(rec):
             skipped += 1
             continue
-        await pipeline.reconcile_session(rec)
+        # Per-record isolation mirrors /ingest: one row that raises must not
+        # halt the sweep and strand every subsequent row unreconciled until
+        # the next cron tick. The exception is already logged with full
+        # context inside reconcile_session; here we just keep going.
+        try:
+            await pipeline.reconcile_session(rec)
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "reconcile_session_failed",
+                dedupe_key=rec.dedupe_key,
+                rule=rec.finding.rule_id,
+                err=str(e),
+            )
+            errored += 1
+            continue
         reconciled += 1
-    return {"reconciled": reconciled, "skipped": skipped}
+    return {"reconciled": reconciled, "skipped": skipped, "errored": errored}
 
 
 @app.get("/stats")
