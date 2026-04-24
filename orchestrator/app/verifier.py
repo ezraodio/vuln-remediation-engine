@@ -111,6 +111,12 @@ class Verifier:
                 mark_resolved=True,
             )
             metrics.mttr_seconds.observe(latency)
+            # ACUs are observed once per session at the terminal transition;
+            # observing on every reconcile tick would inflate the histogram
+            # with the session's intermediate running totals (1, 2, 3, …, N)
+            # instead of a single sample at N.
+            if rec.acu_cost is not None:
+                metrics.acu_cost_per_session.observe(rec.acu_cost)
             if rec.issue_number:
                 await self._best_effort_comment(
                     report.dedupe_key,
@@ -121,6 +127,19 @@ class Verifier:
                     event="verify_fixed_comment_failed",
                     logger=logger,
                 )
+                # Close the tracking issue once the fix is verified: the
+                # issue's purpose was to surface the finding for humans; a
+                # verified clean re-scan means the finding is gone, so an
+                # open issue is misleading operator signal.
+                try:
+                    await self.gh.close_issue(rec.finding.repo, rec.issue_number)
+                except httpx.HTTPError as err:
+                    logger.warning("verify_fixed_close_issue_failed", err=str(err))
+                    self.store.log_event(
+                        report.dedupe_key,
+                        "verify_fixed_close_issue_failed",
+                        {"err": str(err)},
+                    )
             return
 
         if report.outcome == VerifyOutcome.STILL_VULNERABLE:

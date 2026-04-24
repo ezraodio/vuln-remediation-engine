@@ -175,6 +175,27 @@ class GitHubClient:
         )
         r.raise_for_status()
 
+    async def close_issue(
+        self, repo: str, number: int, *, reason: str = "completed"
+    ) -> None:
+        """Close a tracking issue once the underlying finding is resolved.
+
+        PATCH is idempotent so retrying on a lost response is safe — replay
+        against an already-closed issue is a 200 no-op with the same body.
+        `reason="completed"` tells GitHub to render the green "Closed as
+        completed" marker, distinguishing it from "not planned" closures.
+        """
+        if self.mock:
+            log.info("mock_issue_close", repo=repo, number=number, reason=reason)
+            return
+        r = await self._request(
+            "PATCH",
+            f"/repos/{repo}/issues/{number}",
+            json={"state": "closed", "state_reason": reason},
+            retry=True,
+        )
+        r.raise_for_status()
+
     # ---------- pulls ----------
 
     async def get_pr_state(self, pr_url: str) -> dict | None:

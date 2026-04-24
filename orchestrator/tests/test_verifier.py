@@ -23,9 +23,15 @@ class _RecordingDevin:
 class _RecordingGitHub:
     def __init__(self) -> None:
         self.comments: list[tuple[str, int, str]] = []
+        self.closed: list[tuple[str, int]] = []
 
     async def comment_issue(self, repo: str, number: int, body: str) -> None:
         self.comments.append((repo, number, body))
+
+    async def close_issue(
+        self, repo: str, number: int, *, reason: str = "completed"
+    ) -> None:
+        self.closed.append((repo, number))
 
 
 def _seed_record(store, *, session_id: str = "sess-1", issue_number: int = 7):
@@ -70,6 +76,7 @@ async def test_clean_marks_verified_fixed_and_resolves(tmp_store):
     assert devin.messages == []
     assert len(gh.comments) == 1
     assert "no longer reported" in gh.comments[0][2]
+    assert gh.closed == [("o/r", 7)]
 
 
 @pytest.mark.asyncio

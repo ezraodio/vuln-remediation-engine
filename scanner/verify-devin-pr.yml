@@ -87,9 +87,17 @@ jobs:
               except Exception as e:
                   print(f"Failed to load tracking issue {issue_num}: {e}", file=sys.stderr)
 
+          # Sanitize before writing to GITHUB_OUTPUT. The metadata JSON
+          # comes from a GitHub issue body that any repo collaborator can
+          # edit, so an attacker-controlled newline in a value would inject
+          # a second `key=value` line into the step output, overwriting
+          # downstream steps' inputs (e.g. flipping outcome to "clean"
+          # on an unfixed vulnerability). Orchestrator-emitted values are
+          # always short single-line strings; drop CR/LF defensively.
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               for k, v in meta.items():
-                  f.write(f"{k}={v or ''}\n")
+                  s = re.sub(r"[\r\n]", "", str(v or ""))
+                  f.write(f"{k}={s}\n")
               f.write(f"present={'true' if meta['dedupe_key'] else 'false'}\n")
           PY
 
@@ -144,9 +152,14 @@ jobs:
           # SAST: still_vuln iff bandit reports the SAME rule id (and, when
           # available, in the same file we asked Devin to fix).
           if kind == "sast":
+              # Broad catch: bandit runs under `|| true` in the scan step,
+              # so reports/bandit.json may be missing OR half-written /
+              # empty / invalid JSON. JSONDecodeError isn't a subclass of
+              # FileNotFoundError — a narrow catch here would crash the
+              # step and the orchestrator would never receive a verdict.
               try:
                   b = json.load(open("reports/bandit.json"))
-              except FileNotFoundError:
+              except Exception:
                   b = {"results": []}
               hits = []
               for r in b.get("results", []):

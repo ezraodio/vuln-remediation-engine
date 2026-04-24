@@ -356,14 +356,29 @@ class RemediationPipeline:
         """Write Devin's current ACU total to the record if it has grown.
 
         Devin's running total is monotonic; always take the latest report.
+        The histogram is intentionally NOT observed here — a session reconciled
+        five times with running totals (1, 2, 3, 4, 5) would generate five
+        samples summing to 15 instead of one sample of 5, wrecking percentile
+        and average math. See `_observe_terminal_acu_cost`.
         """
         acu = self.devin.session_acu_cost(session)
         if acu is None or (rec.acu_cost is not None and acu <= rec.acu_cost):
             return
         self.store.update_status(rec.dedupe_key, rec.status, acu_cost=acu)
         self.store.log_event(rec.dedupe_key, "acu_cost_updated", {"acu": acu})
-        metrics.acu_cost_per_session.observe(acu)
         rec.acu_cost = acu
+
+    @staticmethod
+    def _observe_terminal_acu_cost(rec: RemediationRecord) -> None:
+        """Emit exactly one ACU-per-session sample at the terminal transition.
+
+        Called from every path that drives a record into a terminal status
+        (FAILED / MERGED_UNVERIFIED / HUMAN_REJECTED; VERIFIED_FIXED lives in
+        the verifier). Terminal records are excluded from `should_reconcile`,
+        so re-entry here is impossible — one sample per session.
+        """
+        if rec.acu_cost is not None:
+            metrics.acu_cost_per_session.observe(rec.acu_cost)
 
     async def _record_pr_opened(self, rec: RemediationRecord, pr: dict) -> None:
         pr_url = pr.get("url") or pr.get("html_url") or str(pr)
@@ -391,6 +406,7 @@ class RemediationPipeline:
             rec.dedupe_key, "session_ended_no_pr", {"status": session.get("status")}
         )
         logger.info("session_ended_no_pr", status=session.get("status"))
+        self._observe_terminal_acu_cost(rec)
 
     async def _reconcile_stale_pr(self, rec: RemediationRecord, logger) -> None:
         """Advance a long-open PR through the terminal states.
@@ -422,6 +438,7 @@ class RemediationPipeline:
                     rec.dedupe_key, "pr_merged_unverified", {"pr": rec.pr_url}
                 )
                 logger.info("pr_merged_unverified", pr=rec.pr_url)
+                self._observe_terminal_acu_cost(rec)
                 return
             if state.get("state") == "closed":
                 self.store.update_status(
@@ -433,6 +450,7 @@ class RemediationPipeline:
                     rec.dedupe_key, "pr_closed_without_merge", {"pr": rec.pr_url}
                 )
                 logger.info("pr_closed_without_merge", pr=rec.pr_url)
+                self._observe_terminal_acu_cost(rec)
                 return
 
         # Age-based NEEDS_ATTENTION must still fire when GitHub is

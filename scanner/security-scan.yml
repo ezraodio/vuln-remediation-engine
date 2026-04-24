@@ -35,12 +35,19 @@ jobs:
         id: pip_audit
         continue-on-error: true
         run: |
-          # Scan every requirements file we find.
+          # Scan every requirements file we find. We record each scan's
+          # original path in reports/manifest.tsv alongside the sanitized
+          # filename; reversing `tr '/' '_'` blindly would corrupt paths
+          # that contain underscores (e.g. requirements_dev.txt becomes
+          # requirements/dev.txt), so the normalizer step below reads the
+          # sidecar mapping instead of guessing.
           mkdir -p reports
+          : > reports/manifest.tsv
           shopt -s nullglob
           for req in requirements*.txt requirements/*.txt requirements-*.txt; do
             [ -f "$req" ] || continue
             safe=$(echo "$req" | tr '/' '_')
+            printf '%s\t%s\n' "$safe" "$req" >> reports/manifest.tsv
             echo "::group::pip-audit $req"
             pip-audit -r "$req" --format json > "reports/pip-audit_${safe}.json" || true
             echo "::endgroup::"
@@ -86,13 +93,30 @@ jobs:
                       return float(sev["score"])
               return None
 
+          # Load the sidecar mapping the shell step wrote so we recover the
+          # ORIGINAL requirements path for each scanned file. Reversing
+          # `tr '/' '_'` with a bare str.replace is lossy whenever the
+          # filename itself contains an underscore (requirements_dev.txt,
+          # constraints_lock.txt, etc.), which silently mislabels the
+          # `manifest_path` on findings and makes operator triage confusing.
+          safe_to_original = {}
+          try:
+              with open("reports/manifest.tsv") as f:
+                  for line in f:
+                      parts = line.rstrip("\n").split("\t", 1)
+                      if len(parts) == 2:
+                          safe_to_original[parts[0]] = parts[1]
+          except FileNotFoundError:
+              pass
+
           # --- pip-audit ---
           for path in sorted(glob.glob("reports/pip-audit_*.json")):
               try:
                   data = json.load(open(path))
               except Exception:
                   continue
-              manifest = path.replace("reports/pip-audit_", "").replace(".json", "").replace("_", "/")
+              safe = path.replace("reports/pip-audit_", "").replace(".json", "")
+              manifest = safe_to_original.get(safe, safe.replace("_", "/"))
               for dep in data.get("dependencies", []):
                   for v in dep.get("vulns", []):
                       cvss = extract_cvss(v)

@@ -161,6 +161,7 @@ See `.env.example` for the full list. Most important knobs:
 │   │   ├── db.py                   # SQLite remediation store
 │   │   ├── prompts.py              # Devin prompt templates
 │   │   ├── observability.py        # /stats aggregation
+│   │   ├── demo_seed.py            # CLI: populate SQLite for the Loom pre-flight
 │   │   ├── models.py, config.py, logging_config.py
 │   │   └── templates/dashboard.html
 │   ├── tests/
@@ -191,6 +192,38 @@ See `.env.example` for the full list. Most important knobs:
 - **Failure path feeds back, doesn't fan out**. If the re-scan says the fix
   didn't work, we `send_message` into the same session. One session per
   finding, always.
+
+## Recording the demo (Loom pre-flight)
+
+The dashboard is cold-start blank; recording against zeros is a weak
+narrative. Before hitting record, seed a realistic state mix so every
+panel on `/dashboard` has something to point at (success rate, MTTR,
+active sessions, needs-attention, per-rule heatmap).
+
+```bash
+# 1. Start the orchestrator in mock mode so no real ACUs are spent
+cp .env.example .env     # ensure MOCK_MODE=true
+docker compose up -d --build
+
+# 2. Seed the SQLite store with 9 representative records
+#    (3 VERIFIED_FIXED, 2 PR_OPENED, 1 SESSION_RUNNING, 1 VERIFICATION_FAILED,
+#     1 FAILED, 1 MERGED_UNVERIFIED — one of the PR_OPENED rows is stale so
+#     `needs_attention` is non-zero and the stale-PR gauge ticks.)
+docker compose exec orchestrator python -m app.demo_seed --reset
+
+# 3. Open the tabs you'll switch between:
+#    - http://localhost:8080/dashboard
+#    - https://github.com/ezraodio/superset/issues  (tracking issues)
+#    - one of the three live PRs on the fork       (Devin's diff)
+#    - one Devin session from the dashboard links  (feedback-loop evidence)
+#    - http://localhost:8080/metrics               (Prometheus, ~2s B-roll)
+
+# 4. Maximize the browser so nothing crops during capture:
+wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz
+```
+
+The seed script is idempotent (rows share a `demo-seed-*` key prefix),
+so rerunning it before each take resets the dashboard to the same state.
 
 ## Next steps (if this were going to production)
 
