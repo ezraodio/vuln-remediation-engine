@@ -276,11 +276,14 @@ class RemediationPipeline:
     def should_reconcile(self, rec: RemediationRecord) -> bool:
         """Whether ``/reconcile`` should poll Devin for this record.
 
-        Terminal rows (FAILED / FILTERED / DEDUPED / VERIFIED_FIXED /
-        VERIFICATION_FAILED) have nothing left to advance; polling them on
-        every cron tick would burn Devin API budget for no state change.
-        ``resolved_at`` alone is not a sufficient signal because only
-        VERIFIED_FIXED sets it.
+        Terminal rows (``RemediationStatus.is_terminal``: VERIFIED_FIXED /
+        MERGED_UNVERIFIED / HUMAN_REJECTED / FAILED / FILTERED / DEDUPED)
+        have nothing left to advance; polling them on every cron tick
+        would burn Devin API budget for no state change. Non-terminal
+        statuses including VERIFICATION_FAILED *must* keep polling —
+        their session may still iterate, or their PR may still be merged
+        or closed by a human. ``resolved_at`` alone is not a sufficient
+        signal because only VERIFIED_FIXED sets it.
         """
         return bool(rec.session_id) and not rec.status.is_terminal()
 
@@ -313,13 +316,16 @@ class RemediationPipeline:
             await self._record_pr_opened(rec, prs[0])
             return
 
-        # NEEDS_ATTENTION is reached only by aging past the flag threshold,
-        # so we must keep polling that PR — a human might still merge or close
-        # it. Without this, once flagged, the record is invisible to the
-        # reconciler forever even though the PR could legitimately resolve.
+        # Any non-terminal row with a PR needs stale-PR handling: a human
+        # may still merge or close it, and the age check may still flag
+        # it as needing attention. Without this, a VERIFICATION_FAILED
+        # record whose session has ended would be polled every tick with
+        # no state progression — and a NEEDS_ATTENTION row, once flagged,
+        # would be invisible to the reconciler forever.
         if rec.status in {
             RemediationStatus.PR_OPENED,
             RemediationStatus.NEEDS_ATTENTION,
+            RemediationStatus.VERIFICATION_FAILED,
         } and rec.pr_url:
             await self._reconcile_stale_pr(rec, logger)
             return

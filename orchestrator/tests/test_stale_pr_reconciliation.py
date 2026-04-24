@@ -145,3 +145,76 @@ async def test_fresh_open_pr_stays_in_pr_opened(
 
     await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
     assert tmp_store.get(rec.dedupe_key).status == RemediationStatus.PR_OPENED
+
+
+async def test_verification_failed_pr_still_advances_on_merge(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    """A VERIFICATION_FAILED record with a PR must still be reconciled.
+
+    Regression: before, reconcile_session only routed PR_OPENED and
+    NEEDS_ATTENTION records into ``_reconcile_stale_pr``. A finding whose
+    verifier reported ``still_vulnerable`` but whose Devin session then ended
+    would sit in VERIFICATION_FAILED forever, even if a human later merged
+    or closed the PR.
+    """
+    f = make_sast_finding()
+    now = now_utc()
+    past = now - timedelta(hours=30)
+    rec = RemediationRecord(
+        dedupe_key=f.dedupe_key(),
+        finding=f,
+        status=RemediationStatus.VERIFICATION_FAILED,
+        session_id="sess-1",
+        issue_number=1,
+        pr_url="https://github.com/o/r/pull/7",
+        created_at=past,
+        updated_at=past,
+        pr_opened_at=past,
+    )
+    tmp_store.upsert(rec)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "closed", "merged": True}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    out = tmp_store.get(rec.dedupe_key)
+    assert out.status == RemediationStatus.MERGED_UNVERIFIED
+    assert out.resolved_at is not None
+
+
+async def test_verification_failed_pr_ages_into_needs_attention(
+    tmp_store, fake_devin, fake_gh, monkeypatch
+):
+    """VERIFICATION_FAILED rows past the flag threshold must reach operators.
+
+    Without the stale-PR reconciler handling this status, an aged failed
+    verification would never surface on the needs-attention dashboard gate.
+    """
+    f = make_sast_finding()
+    now = now_utc()
+    past = now - timedelta(hours=72)
+    rec = RemediationRecord(
+        dedupe_key=f.dedupe_key(),
+        finding=f,
+        status=RemediationStatus.VERIFICATION_FAILED,
+        session_id="sess-1",
+        issue_number=1,
+        pr_url="https://github.com/o/r/pull/7",
+        created_at=past,
+        updated_at=past,
+        pr_opened_at=past,
+    )
+    tmp_store.upsert(rec)
+    monkeypatch.setattr(fake_devin, "get_session", _fake_active_session)
+
+    async def fake_state(url):  # noqa: ARG001
+        return {"state": "open", "merged": False}
+
+    monkeypatch.setattr(fake_gh, "get_pr_state", fake_state)
+
+    await _pipeline(tmp_store, fake_devin, fake_gh).reconcile_session(rec)
+    assert tmp_store.get(rec.dedupe_key).status == RemediationStatus.NEEDS_ATTENTION
