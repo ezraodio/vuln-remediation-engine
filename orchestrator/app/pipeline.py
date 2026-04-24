@@ -370,7 +370,12 @@ class RemediationPipeline:
         acu = self.devin.session_acu_cost(session)
         if acu is None or (rec.acu_cost is not None and acu <= rec.acu_cost):
             return
-        self.store.update_status(rec.dedupe_key, rec.status, acu_cost=acu)
+        # Narrow update — do not pass rec.status. ``rec`` was loaded before the
+        # ``await self.devin.get_session`` at the top of ``reconcile_session``;
+        # during that yield a concurrent ``/verify/result`` can transition this
+        # row to a terminal status in the DB. Writing the stale in-memory
+        # status back here would overwrite that transition.
+        self.store.update_acu_cost(rec.dedupe_key, acu)
         self.store.log_event(rec.dedupe_key, "acu_cost_updated", {"acu": acu})
         rec.acu_cost = acu
 
