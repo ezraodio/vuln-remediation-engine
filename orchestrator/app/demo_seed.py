@@ -36,7 +36,6 @@ from .models import (
 )
 from .time_utils import now_utc
 
-
 DEMO_KEY_PREFIX = "demo-seed-"
 TARGET_REPO = os.environ.get("DEMO_TARGET_REPO", "ezraodio/superset")
 

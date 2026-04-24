@@ -175,7 +175,7 @@ async def test_verified_fixed_closes_tracking_issue(
 
     closed: list[tuple[str, int]] = []
 
-    async def capture_close(repo, number, *, reason="completed"):
+    async def capture_close(repo, number, *, reason="completed"):  # noqa: ARG001
         closed.append((repo, number))
 
     monkeypatch.setattr(fake_gh, "close_issue", capture_close)

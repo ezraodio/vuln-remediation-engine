@@ -14,7 +14,6 @@ from app import demo_seed
 from app.db import Store
 from app.models import RemediationStatus
 
-
 EXPECTED_MIX = {
     RemediationStatus.VERIFIED_FIXED: 3,
     RemediationStatus.PR_OPENED: 2,

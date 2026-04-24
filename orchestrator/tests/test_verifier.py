@@ -29,7 +29,11 @@ class _RecordingGitHub:
         self.comments.append((repo, number, body))
 
     async def close_issue(
-        self, repo: str, number: int, *, reason: str = "completed"
+        self,
+        repo: str,
+        number: int,
+        *,
+        reason: str = "completed",  # noqa: ARG002
     ) -> None:
         self.closed.append((repo, number))
 
