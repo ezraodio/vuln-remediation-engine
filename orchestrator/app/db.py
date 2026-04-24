@@ -182,6 +182,25 @@ class Store:
         self.upsert(rec)
         return rec
 
+    def update_acu_cost(self, dedupe_key: str, acu_cost: float) -> None:
+        """Write only the ACU running total.
+
+        Why a narrow update (and not ``update_status`` with the in-memory
+        status): ``reconcile_session`` loads ``rec`` before an ``await`` on
+        the Devin API, then writes ACU back afterwards. A concurrent
+        ``/verify/result`` can transition the row to VERIFIED_FIXED during
+        that await. Writing status from the stale in-memory ``rec`` would
+        overwrite the verifier's terminal transition, resurrect the record
+        on the reconcile loop, and silently lose the verification outcome.
+        Writing only ``acu_cost`` + ``updated_at`` is race-safe.
+        """
+        with self._conn() as c:
+            c.execute(
+                "UPDATE remediations SET acu_cost = ?, updated_at = ? "
+                "WHERE dedupe_key = ?",
+                (acu_cost, now_utc().isoformat(), dedupe_key),
+            )
+
     # ---------- events ----------
 
     def log_event(self, dedupe_key: str, kind: str, payload: dict) -> None:
