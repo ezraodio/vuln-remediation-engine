@@ -7,6 +7,31 @@ actually tell whether it is working.
 
 Target repo in this demo: [`ezraodio/superset`](https://github.com/ezraodio/superset) (fork of Apache Superset).
 
+## Quickstart (5 min, no API keys required)
+
+```bash
+git clone https://github.com/ezraodio/vuln-remediation-engine.git
+cd vuln-remediation-engine
+cp .env.example .env
+
+# Flip MOCK_MODE so the orchestrator runs without a real Devin or GitHub key
+sed -i.bak 's/^MOCK_MODE=false/MOCK_MODE=true/' .env && rm .env.bak
+
+docker compose up -d --build
+sleep 15
+docker compose exec orchestrator python -m app.demo_seed --reset
+
+# Dashboard with 9 seeded remediations covering every state
+open http://localhost:8080/dashboard       # macOS
+# xdg-open http://localhost:8080/dashboard # Linux
+```
+
+Three live Devin-opened remediation PRs against the target Superset fork are
+linked directly from the seeded dashboard rows:
+[#4](https://github.com/ezraodio/superset/pull/4) ·
+[#5](https://github.com/ezraodio/superset/pull/5) ·
+[#6](https://github.com/ezraodio/superset/pull/6).
+
 ## What it does
 
 ```
