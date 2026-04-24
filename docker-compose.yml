@@ -1,0 +1,22 @@
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    image: vuln-remediation-orchestrator:local
+    container_name: vuln-remediation-orchestrator
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - orchestrator_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  orchestrator_data:

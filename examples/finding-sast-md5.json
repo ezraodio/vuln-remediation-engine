@@ -1,0 +1,19 @@
+{
+  "source": "simulate:manual",
+  "findings": [
+    {
+      "kind": "sast",
+      "repo": "ezraodio/superset",
+      "rule_id": "B324",
+      "title": "Use of weak MD5 hash without usedforsecurity=False",
+      "severity": "HIGH",
+      "file_path": "superset/utils/hashing.py",
+      "line": 34,
+      "code_excerpt": "\"md5\": lambda data: hashlib.md5(data).hexdigest(),",
+      "description": "bandit B324/S324 flags hashlib.md5() calls because MD5 is cryptographically broken. For non-security uses (ids, cache keys, fingerprints) pass usedforsecurity=False. For security uses, switch to hashlib.sha256().",
+      "advisory_url": "https://bandit.readthedocs.io/en/latest/plugins/b324_hashlib.html",
+      "scanner": "bandit",
+      "scanned_at": "2026-04-19T21:00:00Z"
+    }
+  ]
+}

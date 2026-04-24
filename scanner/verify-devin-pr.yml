@@ -1,0 +1,247 @@
+name: verify-devin-pr
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      dedupe_key:
+        description: "Orchestrator dedupe_key to verify"
+        required: true
+      pr_url:
+        description: "PR URL (optional)"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: verify-devin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'devin-remediation') ||
+      startsWith(github.event.pull_request.head.ref, 'devin/remediate-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners
+        run: python -m pip install pip-audit bandit
+
+      - name: Load orchestrator metadata from tracking issue
+        id: meta
+        env:
+          PR_JSON: ${{ toJson(github.event.pull_request) }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FALLBACK_KEY: ${{ inputs.dedupe_key }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys, urllib.request
+
+          # On workflow_dispatch there is no PR context, so
+          # ${{ toJson(github.event.pull_request) }} renders the literal
+          # string "null" — not empty, so the `or "{}"` guard doesn't kick
+          # in — and json.loads returns Python None. Guard against that
+          # plus any other non-object JSON payload (e.g. a bare string or
+          # array from a future GitHub change) so the manual-trigger path
+          # doesn't AttributeError before we can read FALLBACK_KEY.
+          _pr = json.loads(os.environ.get("PR_JSON") or "{}")
+          pr_body = (_pr.get("body") if isinstance(_pr, dict) else None) or ""
+          # Prefer an explicit GitHub "closing keyword" reference (Closes/Fixes/
+          # Resolves #N) over a bare #N mention, since Devin's PR body may
+          # reference unrelated issues in discussion before the closing line.
+          # Falls back to the first bare #N if no closing keyword is found.
+          issue_num = None
+          m = re.search(
+              r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#(\d+)",
+              pr_body,
+              re.IGNORECASE,
+          )
+          if not m:
+              m = re.search(r"#(\d+)", pr_body)
+          if m:
+              issue_num = m.group(1)
+
+          meta = {
+              "dedupe_key": os.environ.get("FALLBACK_KEY") or "",
+              "kind": None, "rule_id": None, "file_path": None,
+              "line": None, "package_name": None, "scanner": None,
+          }
+
+          if issue_num:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/issues/{issue_num}",
+                  headers={
+                      "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      issue = json.loads(r.read())
+                  body = issue.get("body") or ""
+                  mm = re.search(r"<!--\s*orchestrator-meta:(\{.*?\})\s*-->", body)
+                  if mm:
+                      meta.update(json.loads(mm.group(1)))
+              except Exception as e:
+                  print(f"Failed to load tracking issue {issue_num}: {e}", file=sys.stderr)
+
+          # The metadata JSON comes from a GitHub issue body that any repo
+          # collaborator can edit, so treat it as untrusted. Two injection
+          # vectors to close:
+          #   1. Values can contain '\n' (newline), splitting one write into
+          #      multiple `key=value` lines.
+          #   2. Keys can also contain '\n' via JSON '\u000a' escapes, which
+          #      `json.loads` converts to literal newlines; if we iterated
+          #      meta.items() blindly an attacker-chosen key like
+          #      "evil\nkind=sast" would inject a second output and let the
+          #      downstream filter check the wrong scanner.
+          # Defense in depth: iterate over a fixed allow-list of known keys
+          # instead of meta.items(), and still strip CR/LF from every value
+          # in case an orchestrator bug ever emits one.
+          ALLOWED_KEYS = (
+              "dedupe_key", "kind", "rule_id", "file_path",
+              "line", "package_name", "scanner",
+          )
+          # The `present` flag must reflect what downstream steps will
+          # actually see, i.e. the post-sanitisation dedupe_key. If we
+          # checked meta['dedupe_key'] directly, a metadata block with
+          # dedupe_key="\n" would set present=true (raw is truthy) while
+          # sanitisation strips it to "" — and the "Decide outcome" step
+          # would POST a verdict with an empty dedupe_key to the
+          # orchestrator. Track the sanitized value as we write it.
+          sanitized: dict[str, str] = {}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for k in ALLOWED_KEYS:
+                  v = meta.get(k)
+                  s = re.sub(r"[\r\n]", "", str(v or ""))
+                  sanitized[k] = s
+                  f.write(f"{k}={s}\n")
+              f.write(f"present={'true' if sanitized['dedupe_key'] else 'false'}\n")
+          PY
+
+      - name: Run scanners on PR branch
+        id: rescan
+        if: steps.meta.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          TARGET="superset"
+          [ -d "$TARGET" ] || TARGET="."
+          bandit -r "$TARGET" -ll -f json -o reports/bandit.json --quiet || true
+          shopt -s nullglob
+          for req in requirements*.txt requirements/*.txt; do
+              [ -f "$req" ] || continue
+              safe=$(echo "$req" | tr '/' '_')
+              pip-audit -r "$req" --format json > "reports/pip-audit_${safe}.json" || true
+          done
+
+      - name: Decide outcome and POST /verify/result
+        if: steps.meta.outputs.present == 'true'
+        env:
+          ORCHESTRATOR_URL: ${{ secrets.ORCHESTRATOR_URL }}
+          INGEST_SHARED_SECRET: ${{ secrets.INGEST_SHARED_SECRET }}
+          DEDUPE_KEY: ${{ steps.meta.outputs.dedupe_key }}
+          RULE_ID: ${{ steps.meta.outputs.rule_id }}
+          KIND: ${{ steps.meta.outputs.kind }}
+          FILE_PATH: ${{ steps.meta.outputs.file_path }}
+          PACKAGE_NAME: ${{ steps.meta.outputs.package_name }}
+          PR_URL: ${{ github.event.pull_request.html_url || inputs.pr_url }}
+        run: |
+          python - <<'PY'
+          import glob, json, os, urllib.request
+
+          rule = os.environ.get("RULE_ID") or ""
+          kind = os.environ.get("KIND") or ""
+          want_file = (os.environ.get("FILE_PATH") or "").strip()
+          want_pkg = (os.environ.get("PACKAGE_NAME") or "").strip().lower()
+
+          # Bail if critical metadata is missing. Without rule+kind we can't
+          # filter scanner output to *this* finding; posting "clean" anyway
+          # would silently mark the record VERIFIED_FIXED, turning a metadata
+          # bug into a false all-clear. Skip the POST so the orchestrator's
+          # stale-PR reconciler stays authoritative.
+          if not rule or kind not in ("sast", "dep_cve"):
+              print(f"Missing/unknown metadata (rule={rule!r}, kind={kind!r}); skipping POST")
+              raise SystemExit(0)
+
+          outcome = "clean"
+          details = []
+
+          # SAST: still_vuln iff bandit reports the SAME rule id (and, when
+          # available, in the same file we asked Devin to fix).
+          if kind == "sast":
+              # Broad catch: bandit runs under `|| true` in the scan step,
+              # so reports/bandit.json may be missing OR half-written /
+              # empty / invalid JSON. JSONDecodeError isn't a subclass of
+              # FileNotFoundError — a narrow catch here would crash the
+              # step and the orchestrator would never receive a verdict.
+              try:
+                  b = json.load(open("reports/bandit.json"))
+              except Exception:
+                  b = {"results": []}
+              hits = []
+              for r in b.get("results", []):
+                  if r.get("test_id") != rule:
+                      continue
+                  if want_file and r.get("filename") and want_file not in r["filename"]:
+                      continue
+                  hits.append(f"{r.get('filename')}:{r.get('line_number')} {r.get('test_id')}")
+              if hits:
+                  outcome = "still_vuln"
+                  details.append("bandit: " + "; ".join(hits[:10]))
+
+          # Dep CVE: still_vuln iff pip-audit reports the SAME CVE id on the
+          # SAME package we asked Devin to upgrade.
+          if kind == "dep_cve":
+              hits = []
+              for p in glob.glob("reports/pip-audit_*.json"):
+                  try:
+                      d = json.load(open(p))
+                  except Exception:
+                      continue
+                  for dep in d.get("dependencies", []):
+                      if want_pkg and dep.get("name", "").lower() != want_pkg:
+                          continue
+                      for v in dep.get("vulns", []):
+                          if rule and v.get("id") != rule:
+                              continue
+                          hits.append(f"{dep['name']}=={dep.get('version')} {v.get('id')}")
+              if hits:
+                  outcome = "still_vuln"
+                  details.append("pip-audit: " + "; ".join(hits[:10]))
+
+          payload = {
+              "dedupe_key": os.environ["DEDUPE_KEY"],
+              "pr_url": os.environ.get("PR_URL"),
+              "outcome": outcome,
+              "scanner_output": "\n".join(details) or f"{rule} no longer reported",
+          }
+
+          url = os.environ.get("ORCHESTRATOR_URL", "").rstrip("/")
+          if not url:
+              print("ORCHESTRATOR_URL unset; printing payload only")
+              print(json.dumps(payload, indent=2))
+              raise SystemExit(0)
+
+          req = urllib.request.Request(
+              url + "/verify/result",
+              data=json.dumps(payload).encode(),
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Ingest-Secret": os.environ["INGEST_SHARED_SECRET"],
+              },
+          )
+          with urllib.request.urlopen(req, timeout=60) as r:
+              print(r.read().decode())
+          PY
