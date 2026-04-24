@@ -112,12 +112,21 @@ jobs:
               "dedupe_key", "kind", "rule_id", "file_path",
               "line", "package_name", "scanner",
           )
+          # The `present` flag must reflect what downstream steps will
+          # actually see, i.e. the post-sanitisation dedupe_key. If we
+          # checked meta['dedupe_key'] directly, a metadata block with
+          # dedupe_key="\n" would set present=true (raw is truthy) while
+          # sanitisation strips it to "" — and the "Decide outcome" step
+          # would POST a verdict with an empty dedupe_key to the
+          # orchestrator. Track the sanitized value as we write it.
+          sanitized: dict[str, str] = {}
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               for k in ALLOWED_KEYS:
                   v = meta.get(k)
                   s = re.sub(r"[\r\n]", "", str(v or ""))
+                  sanitized[k] = s
                   f.write(f"{k}={s}\n")
-              f.write(f"present={'true' if meta['dedupe_key'] else 'false'}\n")
+              f.write(f"present={'true' if sanitized['dedupe_key'] else 'false'}\n")
           PY
 
       - name: Run scanners on PR branch
