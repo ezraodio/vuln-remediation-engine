@@ -87,15 +87,26 @@ jobs:
               except Exception as e:
                   print(f"Failed to load tracking issue {issue_num}: {e}", file=sys.stderr)
 
-          # Sanitize before writing to GITHUB_OUTPUT. The metadata JSON
-          # comes from a GitHub issue body that any repo collaborator can
-          # edit, so an attacker-controlled newline in a value would inject
-          # a second `key=value` line into the step output, overwriting
-          # downstream steps' inputs (e.g. flipping outcome to "clean"
-          # on an unfixed vulnerability). Orchestrator-emitted values are
-          # always short single-line strings; drop CR/LF defensively.
+          # The metadata JSON comes from a GitHub issue body that any repo
+          # collaborator can edit, so treat it as untrusted. Two injection
+          # vectors to close:
+          #   1. Values can contain '\n' (newline), splitting one write into
+          #      multiple `key=value` lines.
+          #   2. Keys can also contain '\n' via JSON '\u000a' escapes, which
+          #      `json.loads` converts to literal newlines; if we iterated
+          #      meta.items() blindly an attacker-chosen key like
+          #      "evil\nkind=sast" would inject a second output and let the
+          #      downstream filter check the wrong scanner.
+          # Defense in depth: iterate over a fixed allow-list of known keys
+          # instead of meta.items(), and still strip CR/LF from every value
+          # in case an orchestrator bug ever emits one.
+          ALLOWED_KEYS = (
+              "dedupe_key", "kind", "rule_id", "file_path",
+              "line", "package_name", "scanner",
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              for k, v in meta.items():
+              for k in ALLOWED_KEYS:
+                  v = meta.get(k)
                   s = re.sub(r"[\r\n]", "", str(v or ""))
                   f.write(f"{k}={s}\n")
               f.write(f"present={'true' if meta['dedupe_key'] else 'false'}\n")
